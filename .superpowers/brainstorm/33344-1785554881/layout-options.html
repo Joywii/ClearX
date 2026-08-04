@@ -1,0 +1,38 @@
+<h2>ClearX 扫描结果布局</h2>
+<p class="subtitle">请选择更接近你期望的 OmniDiskSweeper 使用方式。两种方案都会显示实时扫描状态、大小和占比。</p>
+
+<div class="cards">
+  <div class="card" data-choice="column-browser" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="font-size:12px;text-align:left">
+        <div class="mockup-header">ClearX - Macintosh HD</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;min-height:220px">
+          <div style="border-right:1px solid #d8d8d8;padding:9px;background:#f8f8f8"><strong>名称　　大小</strong><br><br>Users　　42.6 GB<br>Library　 31.2 GB<br>System　　16.5 GB<br>应用程序　9.8 GB</div>
+          <div style="border-right:1px solid #d8d8d8;padding:9px"><strong>名称　　大小</strong><br><br>alice　　38.0 GB<br>Shared　　4.6 GB</div>
+          <div style="padding:9px"><strong>名称　　大小</strong><br><br>Downloads　18.3 GB<br>Library　　 11.7 GB<br>Documents　 5.2 GB<br>Desktop　　 1.1 GB</div>
+        </div>
+        <div style="padding:8px;border-top:1px solid #d8d8d8">正在扫描 · 已发现 74,218 个项目　　取消</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. 多列浏览器</h3>
+      <p>直接参考 OmniDiskSweeper。选择某一目录后，在右侧列继续下钻；每列都是当前层级的按大小列表。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="outline-tree" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup" style="font-size:12px;text-align:left">
+        <div class="mockup-header">ClearX - Macintosh HD</div>
+        <div style="min-height:220px;padding:10px;line-height:1.9"><strong>名称　　　　　　　　　大小　 占比</strong><br>▾ Macintosh HD　　　　　　100 GB　100%<br>&nbsp;&nbsp;▸ Users　　　　　　　　　42.6 GB　 43%<br>&nbsp;&nbsp;▸ Library　　　　　　　　31.2 GB　 31%<br>&nbsp;&nbsp;▸ System　　　　　　　　 16.5 GB　 17%<br>&nbsp;&nbsp;▸ 应用程序　　　　　　　　9.8 GB　 10%</div>
+        <div style="padding:8px;border-top:1px solid #d8d8d8">正在扫描 · 已发现 74,218 个项目　　取消</div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. 单列目录树</h3>
+      <p>更接近现代 Finder 列表。层级和全部结果在同一列，便于搜索和长期浏览，但与参考应用差异更大。</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle">推荐 A：多列浏览器最贴近参考产品，且能将“逐层定位最大目录”的操作保持为单次点击。请点击选项，然后在终端回复你的选择或改动意见。</p>
