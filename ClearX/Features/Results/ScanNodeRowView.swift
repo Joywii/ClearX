@@ -2,7 +2,6 @@ import SwiftUI
 
 struct ScanNodeRowView: View {
     let node: ScanNodeSummary
-    let parentSize: Int64?
     let isSelected: Bool
     let isEstimating: Bool
 
@@ -34,17 +33,9 @@ struct ScanNodeRowView: View {
                     }
                 }
 
-                HStack(spacing: 6) {
-                    Text(ByteCountPresentation.string(for: node.allocatedSize))
-                    if let proportion = ByteCountPresentation.proportionString(
-                        itemSize: node.allocatedSize,
-                        parentSize: parentSize
-                    ) {
-                        Text(proportion)
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Text(ByteCountPresentation.string(for: node.allocatedSize))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer(minLength: 4)

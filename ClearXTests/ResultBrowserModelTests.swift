@@ -63,15 +63,20 @@ final class ResultBrowserModelTests: XCTestCase {
     func testPartialLiveUpdateKeepsExistingRowOrderUntilColumnCompletes() async {
         let first = makeNode(name: "先发现", size: 10)
         let second = makeNode(name: "后发现", size: 100)
-        let model = ResultBrowserModel(source: makeSource(), columnLoader: ColumnLoaderStub(columns: [:]))
+        let loader = ColumnLoaderStub(columns: [
+            nil: SnapshotBrowserColumn(parent: nil, nodes: [first], state: .partial)
+        ])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
 
-        model.applyLiveColumn(.init(parent: nil, nodes: [first], state: .partial))
-        model.applyLiveColumn(.init(parent: nil, nodes: [second, first], state: .partial))
+        await model.loadInitialColumn()
+        await loader.setColumn(SnapshotBrowserColumn(parent: nil, nodes: [first, second], state: .partial), for: nil)
+        await model.refreshVisibleColumns(for: makeProgress(changedParentIDs: [ScanNodeID()]))
 
         XCTAssertEqual(model.columns[0].nodes.map(\.id), [first.id, second.id])
         XCTAssertEqual(model.columns[0].state, .partial)
 
-        model.applyLiveColumn(.init(parent: nil, nodes: [first, second], state: .complete))
+        await loader.setColumn(SnapshotBrowserColumn(parent: nil, nodes: [first, second], state: .complete), for: nil)
+        await model.refreshVisibleColumns(for: makeProgress(completedDirectoryIDs: [ScanNodeID()]))
 
         XCTAssertEqual(model.columns[0].nodes.map(\.id), [second.id, first.id])
         XCTAssertEqual(model.columns[0].state, .complete)
@@ -81,14 +86,15 @@ final class ResultBrowserModelTests: XCTestCase {
         let nodes = (0..<251).map { index in
             makeNode(name: "项目-\(index)", size: Int64(index))
         }
-        let model = ResultBrowserModel(source: makeSource(), columnLoader: ColumnLoaderStub(columns: [:]))
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: nodes)])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
 
-        model.applyLiveColumn(.init(parent: nil, nodes: nodes, state: .complete))
+        await model.loadInitialColumn()
 
         XCTAssertEqual(model.visibleNodes(inColumn: 0).count, 250)
         XCTAssertEqual(model.remainingNodeCount(inColumn: 0), 1)
 
-        model.loadMore(inColumn: 0)
+        await model.loadMore(inColumn: 0)
 
         XCTAssertEqual(model.visibleNodes(inColumn: 0).count, 251)
         XCTAssertEqual(model.remainingNodeCount(inColumn: 0), 0)
@@ -96,9 +102,12 @@ final class ResultBrowserModelTests: XCTestCase {
 
     func testLiveLoadingColumnSupportsSkeletonStateAndEstimateMarkers() async {
         let node = makeNode(name: "目录", kind: .directory, size: 0)
-        let model = ResultBrowserModel(source: makeSource(), columnLoader: ColumnLoaderStub(columns: [:]))
+        let loader = ColumnLoaderStub(columns: [
+            nil: SnapshotBrowserColumn(parent: nil, nodes: [node], state: .loading, estimatingNodeIDs: [node.id])
+        ])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
 
-        model.applyLiveColumn(.init(parent: nil, nodes: [node], state: .loading, estimatingNodeIDs: [node.id]))
+        await model.loadInitialColumn()
 
         XCTAssertEqual(model.columns[0].state, .loading)
         XCTAssertEqual(model.columns[0].estimatingNodeIDs, [node.id])
@@ -137,19 +146,51 @@ final class ResultBrowserModelTests: XCTestCase {
     private func makeNode(name: String, parentID: ScanNodeID? = nil, kind: ScanNodeKind = .file, size: Int64) -> ScanNodeSummary {
         ScanNodeSummary(parentID: parentID, url: URL(fileURLWithPath: "/tmp/clearx-tests/\(name)"), kind: kind, allocatedSize: size)
     }
+
+    private func makeProgress(
+        changedParentIDs: Set<ScanNodeID> = [],
+        completedDirectoryIDs: Set<ScanNodeID> = []
+    ) -> ScanProgress {
+        ScanProgress(
+            discoveredNodeCount: 0,
+            completedDirectoryCount: 0,
+            currentURL: nil,
+            changedParentIDs: changedParentIDs,
+            completedDirectoryIDs: completedDirectoryIDs
+        )
+    }
 }
 
 private actor ColumnLoaderStub: SnapshotColumnLoading {
-    private let columns: [ScanNodeID?: SnapshotBrowserColumn]
+    private var columns: [ScanNodeID?: SnapshotBrowserColumn]
     private var parents: [ScanNodeID?] = []
 
     init(columns: [ScanNodeID?: SnapshotBrowserColumn]) {
         self.columns = columns
     }
 
-    func loadColumn(for source: ScanSource, parent: ScanNodeSummary?) async throws -> SnapshotBrowserColumn {
+    func loadColumn(
+        for source: ScanSource,
+        parent: ScanNodeSummary?,
+        offset: Int,
+        limit: Int
+    ) async throws -> SnapshotBrowserColumn {
         parents.append(parent?.id)
-        return columns[parent?.id] ?? SnapshotBrowserColumn(parent: parent, nodes: [])
+        let column = columns[parent?.id] ?? SnapshotBrowserColumn(parent: parent, nodes: [])
+        let lowerBound = min(max(0, offset), column.nodes.count)
+        let upperBound = min(column.nodes.count, lowerBound + limit)
+        let pageNodes = Array(column.nodes[lowerBound..<upperBound])
+        return SnapshotBrowserColumn(
+            parent: column.parent,
+            nodes: pageNodes,
+            totalNodeCount: column.totalNodeCount,
+            state: column.state,
+            estimatingNodeIDs: column.estimatingNodeIDs.intersection(pageNodes.map(\.id))
+        )
+    }
+
+    func setColumn(_ column: SnapshotBrowserColumn, for parentID: ScanNodeID?) {
+        columns[parentID] = column
     }
 
     func requestedParents() -> [ScanNodeID?] {
@@ -158,7 +199,12 @@ private actor ColumnLoaderStub: SnapshotColumnLoading {
 }
 
 private struct FailingColumnLoader: SnapshotColumnLoading {
-    func loadColumn(for source: ScanSource, parent: ScanNodeSummary?) async throws -> SnapshotBrowserColumn {
+    func loadColumn(
+        for source: ScanSource,
+        parent: ScanNodeSummary?,
+        offset: Int,
+        limit: Int
+    ) async throws -> SnapshotBrowserColumn {
         throw ColumnLoadError.unavailable
     }
 

@@ -21,10 +21,10 @@ struct ScanNodeSummary: Identifiable, Hashable, Codable, Sendable {
     let parentID: ScanNodeID?
     let url: URL
     let kind: ScanNodeKind
-    let allocatedSize: Int64
+    var allocatedSize: Int64
     let modificationDate: Date?
-    let countsTowardAllocatedSize: Bool
-    let isIncomplete: Bool
+    var countsTowardAllocatedSize: Bool
+    var isIncomplete: Bool
 
     init(
         id: ScanNodeID = ScanNodeID(),

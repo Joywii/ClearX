@@ -28,9 +28,11 @@ actor InMemoryScanCache {
         results[source.rootURL.standardizedFileURL]
     }
 
-    func store(_ result: ScanResult) {
-        guard case .complete = result.status else { return }
+    @discardableResult
+    func store(_ result: ScanResult) -> Bool {
+        guard case .complete = result.status else { return false }
         results[result.source.rootURL.standardizedFileURL] = result
+        return true
     }
 
     func removeResult(for source: ScanSource) {
@@ -38,77 +40,63 @@ actor InMemoryScanCache {
     }
 }
 
-/// Holds the mutable tree for one in-flight scan. It is separate from the
-/// complete-result cache so cancelled scans remain browsable but are never reused.
-actor LiveScanTree {
-    private var nodes: [ScanNodeID: ScanNodeSummary] = [:]
-    private var childrenByParent: [ScanNodeID: [ScanNodeID]] = [:]
-    private var rootNodeID: ScanNodeID?
-    private var completedDirectoryURLs = Set<URL>()
+actor DisplayedScanSnapshot {
+    private var snapshot: ScanTreeStore?
 
-    func reset() {
-        nodes.removeAll(keepingCapacity: true)
-        childrenByParent.removeAll(keepingCapacity: true)
-        rootNodeID = nil
-        completedDirectoryURLs.removeAll(keepingCapacity: true)
+    func set(_ snapshot: ScanTreeStore) {
+        self.snapshot = snapshot
     }
 
-    func apply(_ progress: ScanProgress) {
-        for node in progress.updatedNodes {
-            if nodes[node.id] == nil, let parentID = node.parentID {
-                childrenByParent[parentID, default: []].append(node.id)
-            }
-            nodes[node.id] = node
-            if node.parentID == nil {
-                rootNodeID = node.id
-            }
-        }
-        completedDirectoryURLs.formUnion(progress.completedDirectoryURLs)
+    func clear() {
+        snapshot = nil
     }
 
-    func column(for parent: ScanNodeSummary?) -> SnapshotBrowserColumnUpdate {
-        guard let resolvedParent = parent ?? rootNodeID.flatMap({ nodes[$0] }) else {
-            return SnapshotBrowserColumnUpdate(parent: parent, nodes: [], state: .loading)
-        }
-        let childNodes = (childrenByParent[resolvedParent.id] ?? []).compactMap { nodes[$0] }
-        let isComplete = completedDirectoryURLs.contains(resolvedParent.url.standardizedFileURL)
-        let estimates = Set(childNodes.compactMap { node in
-            node.kind == .directory && !completedDirectoryURLs.contains(node.url.standardizedFileURL) ? node.id : nil
-        })
-        return SnapshotBrowserColumnUpdate(
-            parent: parent,
-            nodes: childNodes,
-            state: isComplete ? .complete : .partial,
-            estimatingNodeIDs: estimates
-        )
+    func current() -> ScanTreeStore? {
+        snapshot
     }
 }
 
 /// Adapts a session-cached scan tree to the result browser's lazy-column API.
 struct InMemorySnapshotColumnLoader: SnapshotColumnLoading {
-    let cache: InMemoryScanCache
-    let liveTree: LiveScanTree?
+    let displayedSnapshot: DisplayedScanSnapshot
 
-    init(cache: InMemoryScanCache = .shared, liveTree: LiveScanTree? = nil) {
-        self.cache = cache
-        self.liveTree = liveTree
+    init(displayedSnapshot: DisplayedScanSnapshot) {
+        self.displayedSnapshot = displayedSnapshot
     }
 
-    func loadColumn(for source: ScanSource, parent: ScanNodeSummary?) async throws -> SnapshotBrowserColumn {
-        if let result = await cache.result(for: source), let root = result.rootNode {
-            let parentNode = parent ?? root
-            return SnapshotBrowserColumn(parent: parent, nodes: result.children(of: parentNode.id))
+    func loadColumn(
+        for source: ScanSource,
+        parent: ScanNodeSummary?,
+        offset: Int,
+        limit: Int
+    ) async throws -> SnapshotBrowserColumn {
+        guard let snapshot = await displayedSnapshot.current() else {
+            return SnapshotBrowserColumn(parent: parent, nodes: [], totalNodeCount: 0, state: .loading)
         }
-        guard let liveTree else {
-            return SnapshotBrowserColumn(parent: parent, nodes: [], state: .loading)
+        let root = parent == nil ? await snapshot.rootNode() : nil
+        guard let resolvedParent = parent ?? root else {
+            return SnapshotBrowserColumn(parent: parent, nodes: [], totalNodeCount: 0, state: .loading)
         }
-        let update = await liveTree.column(for: parent)
+        let currentParent: ScanNodeSummary? = if let parent {
+            await snapshot.node(withID: parent.id) ?? parent
+        } else {
+            nil
+        }
+        let page = await snapshot.page(parentID: resolvedParent.id, offset: offset, limit: limit)
         return SnapshotBrowserColumn(
-            parent: update.parent,
-            nodes: update.nodes,
-            state: update.state,
-            estimatingNodeIDs: update.estimatingNodeIDs,
-            sortsNodes: update.state == .complete
+            parent: currentParent,
+            nodes: page.nodes,
+            totalNodeCount: page.totalCount,
+            state: columnState(from: page.state),
+            estimatingNodeIDs: page.estimatingNodeIDs
         )
+    }
+
+    private func columnState(from state: ScanNodePageState) -> SnapshotBrowserColumnState {
+        switch state {
+        case .loading: .loading
+        case .partial: .partial
+        case .complete: .complete
+        }
     }
 }

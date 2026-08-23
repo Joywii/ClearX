@@ -5,7 +5,12 @@ import Foundation
 /// Tree mutation lives in an actor because up to four directory workers may
 /// discover siblings concurrently for the same source.
 struct FileTreeScanner: FileTreeScanning {
-    private let workersPerSource = 8
+    private let workersPerSource = 4
+    private let tree: ScanTreeStore
+
+    init(tree: ScanTreeStore = ScanTreeStore()) {
+        self.tree = tree
+    }
 
     func scan(source: ScanSource, request: ScanRequest, progress: (@Sendable (ScanProgress) async -> Void)? = nil) async throws -> ScanResult {
         let collectsPerformanceMetrics = ScanPerformanceDiagnostics.isEnabled
@@ -13,28 +18,28 @@ struct FileTreeScanner: FileTreeScanning {
         let scanStartedAt = ScanPerformanceDiagnostics.now()
         let rootURL = request.rootURL.standardizedFileURL
         guard let rootStatus = Self.fileStatus(at: rootURL), !rootStatus.isSymbolicLink else {
-            return ScanResult(source: source, nodes: [Self.rootNode(for: rootURL, incomplete: true)], status: .incomplete([.sourceUnavailable]))
+            _ = await tree.begin(rootURL: rootURL, kind: .directory)
+            await tree.markIncomplete(.sourceUnavailable)
+            let completion = await tree.finishScan()
+            return ScanResult(source: source, snapshot: tree, status: completion.status, nodeCount: completion.nodeCount)
         }
 
-        let root = WorkingNode(
-            id: ScanNodeID(),
-            parentID: nil,
-            url: rootURL,
-            kind: rootStatus.isDirectory ? .directory : .file,
-            allocatedSize: 0,
-            countsTowardAllocatedSize: true,
-            isIncomplete: false
-        )
-        let state = ScanAccumulator(root: root)
+        let rootID = await tree.begin(rootURL: rootURL, kind: rootStatus.isDirectory ? .directory : .file)
         let publisher = ProgressPublisher(
-            snapshot: { await state.takeProgress() },
+            snapshot: { await tree.takeProgress() },
             sink: progress
         )
 
         guard rootStatus.isDirectory else {
-            await state.setRootFileSize(from: rootStatus)
+            await tree.setRootFileSize(from: rootStatus)
             await publisher.publish()
-            return await state.result(for: source)
+            let completion = await tree.finishScan()
+            return ScanResult(source: source, snapshot: tree, status: completion.status, nodeCount: completion.nodeCount)
+        }
+
+        let memorySampler = collectsPerformanceMetrics ? ScanMemorySampler() : nil
+        let memoryTask = memorySampler.map { sampler in
+            Task { await sampler.samplePeriodically() }
         }
 
         await publisher.publish()
@@ -42,7 +47,7 @@ struct FileTreeScanner: FileTreeScanning {
             await publisher.publishPeriodically()
         }
         let queue = DirectoryWorkQueue(sourceID: source.id, coordinator: .shared)
-        await queue.enqueue([DirectoryWork(nodeID: root.id, url: rootURL, depth: 0)])
+        await queue.enqueue([DirectoryWork(nodeID: rootID, url: rootURL, depth: 0)])
 
         var combinedMetrics = ScanWorkerPerformanceMetrics(workerID: -1, startedAtNanos: scanStartedAt)
         await withTaskGroup(of: ScanWorkerPerformanceMetrics.self) { group in
@@ -55,7 +60,7 @@ struct FileTreeScanner: FileTreeScanning {
                         sourceID: source.id,
                         expectedDevice: rootStatus.deviceID,
                         queue: queue,
-                        state: state
+                        tree: tree
                     )
                 }
             }
@@ -67,14 +72,22 @@ struct FileTreeScanner: FileTreeScanning {
         await progressTask.value
 
         let finalizationStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
-        await state.finalizeCancelledDirectories()
+        await tree.finalizeCancelledDirectories()
         let finalizationNanos = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.elapsed(since: finalizationStartedAt) : 0
         await publisher.publish()
 
         let resultStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
-        let result = await state.result(for: source)
+        let completion = await tree.finishScan()
+        let result = ScanResult(source: source, snapshot: tree, status: completion.status, nodeCount: completion.nodeCount)
         let resultMaterializationNanos = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.elapsed(since: resultStartedAt) : 0
         if collectsPerformanceMetrics {
+            memoryTask?.cancel()
+            await memoryTask?.value
+            let memorySnapshot = await memorySampler?.finish() ?? ScanMemoryPerformanceSnapshot(
+                baselineBytes: nil,
+                peakBytes: nil,
+                finalBytes: nil
+            )
             let queueSnapshot = await queue.performanceSnapshot()
             let publisherSnapshot = await publisher.performanceSnapshot()
             ScanPerformanceDiagnostics.final(
@@ -83,6 +96,7 @@ struct FileTreeScanner: FileTreeScanning {
                 metrics: combinedMetrics,
                 queue: queueSnapshot,
                 publisher: publisherSnapshot,
+                memory: memorySnapshot,
                 elapsedNanos: ScanPerformanceDiagnostics.elapsed(since: scanStartedAt),
                 finalizationNanos: finalizationNanos,
                 resultMaterializationNanos: resultMaterializationNanos
@@ -98,7 +112,7 @@ struct FileTreeScanner: FileTreeScanning {
         sourceID: ScanSourceID,
         expectedDevice: Int64,
         queue: DirectoryWorkQueue,
-        state: ScanAccumulator
+        tree: ScanTreeStore
     ) async -> ScanWorkerPerformanceMetrics {
         var metrics = ScanWorkerPerformanceMetrics(workerID: workerID)
         while let work = await queue.next() {
@@ -116,7 +130,14 @@ struct FileTreeScanner: FileTreeScanning {
                 }
 
                 let applyStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
-                let childDirectories = await state.apply(enumeration: enumeration, to: work.nodeID, expectedDevice: expectedDevice, childDepth: work.depth + 1)
+                let childDirectories: [DirectoryWork]
+                switch enumeration {
+                case let .children(items, _):
+                    childDirectories = await tree.apply(items: items, to: work.nodeID, expectedDevice: expectedDevice, childDepth: work.depth + 1)
+                case .unreadable:
+                    await tree.markUnreadableDirectory(work.nodeID)
+                    childDirectories = []
+                }
                 if collectsPerformanceMetrics {
                     metrics.recordAccumulatorApply(
                         nanos: ScanPerformanceDiagnostics.elapsed(since: applyStartedAt),
@@ -130,17 +151,17 @@ struct FileTreeScanner: FileTreeScanning {
                     metrics.queueNanos &+= ScanPerformanceDiagnostics.elapsed(since: queueStartedAt)
                 }
                 let finishStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
-                await state.finishEnumeratingDirectory(work.nodeID)
+                await tree.finishEnumeratingDirectory(work.nodeID)
                 if collectsPerformanceMetrics {
                     metrics.accumulatorFinishNanos &+= ScanPerformanceDiagnostics.elapsed(since: finishStartedAt)
                 }
             } catch is CancellationError {
-                await state.markCancelled()
+                await tree.markCancelled()
                 await queue.cancelPendingWork()
             } catch {
                 // Unexpected enumeration failures are isolated to this branch.
-                await state.markUnreadableDirectory(work.nodeID)
-                await state.finishEnumeratingDirectory(work.nodeID)
+                await tree.markUnreadableDirectory(work.nodeID)
+                await tree.finishEnumeratingDirectory(work.nodeID)
             }
 
             await queue.completeCurrentWork()
@@ -191,17 +212,6 @@ struct FileTreeScanner: FileTreeScanning {
         return .children(items, sample)
     }
 
-    private static func rootNode(for url: URL, incomplete: Bool) -> ScanNodeSummary {
-        ScanNodeSummary(
-            parentID: nil,
-            url: url,
-            kind: .directory,
-            allocatedSize: 0,
-            countsTowardAllocatedSize: true,
-            isIncomplete: incomplete
-        )
-    }
-
     fileprivate static func fileStatus(at url: URL) -> FileStatus? {
         var info = stat()
         let result = url.withUnsafeFileSystemRepresentation { path in
@@ -231,224 +241,9 @@ private enum DirectoryEnumeration: Sendable {
     }
 }
 
-private enum DiscoveredItem: Sendable {
+enum DiscoveredItem: Sendable {
     case item(URL, FileStatus)
     case unreadableItem
-}
-
-private struct FileIdentity: Hashable, Sendable {
-    let device: Int64
-    let inode: UInt64
-}
-
-private struct WorkingNode: Sendable {
-    let id: ScanNodeID
-    let parentID: ScanNodeID?
-    let url: URL
-    let kind: ScanNodeKind
-    var allocatedSize: Int64
-    let countsTowardAllocatedSize: Bool
-    var isIncomplete: Bool
-    var hasFinishedEnumeration = false
-    var pendingChildDirectories = 0
-    var hasCommittedSizeToParent = false
-
-    var summary: ScanNodeSummary {
-        ScanNodeSummary(
-            id: id,
-            parentID: parentID,
-            url: url,
-            kind: kind,
-            allocatedSize: allocatedSize,
-            countsTowardAllocatedSize: countsTowardAllocatedSize,
-            isIncomplete: isIncomplete
-        )
-    }
-}
-
-private actor ScanAccumulator {
-    private var nodes: [ScanNodeID: WorkingNode]
-    private var nodeOrder: [ScanNodeID]
-    private var countedHardLinks = Set<FileIdentity>()
-    private var incompleteReasons = Set<ScanIncompleteReason>()
-    private var changedNodeIDs = Set<ScanNodeID>()
-    private var completedDirectoryURLs = Set<URL>()
-    private var completedDirectories = 0
-    private var currentURL: URL
-
-    init(root: WorkingNode) {
-        nodes = [root.id: root]
-        nodeOrder = [root.id]
-        changedNodeIDs = [root.id]
-        currentURL = root.url
-    }
-
-    func setRootFileSize(from status: FileStatus) {
-        guard var root = nodes[nodeOrder[0]] else { return }
-        let identity = FileIdentity(device: status.deviceID, inode: status.inode)
-        let shouldCount = status.linkCount <= 1 || countedHardLinks.insert(identity).inserted
-        root.allocatedSize = shouldCount ? status.allocatedSize : 0
-        nodes[root.id] = root
-        changedNodeIDs.insert(root.id)
-    }
-
-    func apply(enumeration: DirectoryEnumeration, to parentID: ScanNodeID, expectedDevice: Int64, childDepth: Int) -> [DirectoryWork] {
-        guard let parent = nodes[parentID] else { return [] }
-        currentURL = parent.url
-        guard case let .children(items, _) = enumeration else {
-            markUnreadableDirectory(parentID)
-            return []
-        }
-
-        var directoryWork = [DirectoryWork]()
-        for item in items {
-            switch item {
-            case .unreadableItem:
-                markUnreadableDirectory(parentID)
-            case let .item(url, status):
-                guard !status.isSymbolicLink else { continue }
-                guard status.deviceID == expectedDevice else { continue }
-
-                let nodeID = ScanNodeID()
-                if status.isDirectory {
-                    let node = WorkingNode(
-                        id: nodeID,
-                        parentID: parentID,
-                        url: url,
-                        kind: .directory,
-                        allocatedSize: 0,
-                        countsTowardAllocatedSize: true,
-                        isIncomplete: false
-                    )
-                    nodes[nodeID] = node
-                    nodeOrder.append(nodeID)
-                    changedNodeIDs.insert(nodeID)
-                    nodes[parentID]?.pendingChildDirectories += 1
-                    changedNodeIDs.insert(parentID)
-                    directoryWork.append(DirectoryWork(nodeID: nodeID, url: url, depth: childDepth))
-                } else {
-                    let identity = FileIdentity(device: status.deviceID, inode: status.inode)
-                    let shouldCount = status.linkCount <= 1 || countedHardLinks.insert(identity).inserted
-                    let node = WorkingNode(
-                        id: nodeID,
-                        parentID: parentID,
-                        url: url,
-                        kind: .file,
-                        allocatedSize: shouldCount ? status.allocatedSize : 0,
-                        countsTowardAllocatedSize: shouldCount,
-                        isIncomplete: false
-                    )
-                    nodes[nodeID] = node
-                    nodeOrder.append(nodeID)
-                    changedNodeIDs.insert(nodeID)
-                    if shouldCount {
-                        addDirectFileSize(status.allocatedSize, to: parentID)
-                    }
-                }
-            }
-        }
-        return directoryWork
-    }
-
-    func finishEnumeratingDirectory(_ nodeID: ScanNodeID) {
-        guard var node = nodes[nodeID] else { return }
-        node.hasFinishedEnumeration = true
-        nodes[nodeID] = node
-        changedNodeIDs.insert(nodeID)
-        resolveCompletedDirectories(startingAt: nodeID)
-    }
-
-    func markUnreadableDirectory(_ nodeID: ScanNodeID) {
-        guard var node = nodes[nodeID] else { return }
-        node.isIncomplete = true
-        nodes[nodeID] = node
-        changedNodeIDs.insert(nodeID)
-        incompleteReasons.insert(.unreadableItem)
-    }
-
-    func markCancelled() {
-        guard let rootID = nodeOrder.first, var root = nodes[rootID] else { return }
-        root.isIncomplete = true
-        nodes[rootID] = root
-        changedNodeIDs.insert(rootID)
-        incompleteReasons.insert(.cancelled)
-    }
-
-    /// Cancellation leaves some directories enumerated only in part. Commit
-    /// their partial totals bottom-up once so every visible ancestor still
-    /// represents all nodes that were discovered before cancellation.
-    func finalizeCancelledDirectories() {
-        guard incompleteReasons.contains(.cancelled) else { return }
-
-        for nodeID in nodeOrder.reversed() {
-            guard var node = nodes[nodeID],
-                  node.kind == .directory,
-                  !node.hasCommittedSizeToParent else {
-                continue
-            }
-
-            node.isIncomplete = true
-            node.hasCommittedSizeToParent = true
-            nodes[nodeID] = node
-            changedNodeIDs.insert(nodeID)
-
-            guard let parentID = node.parentID, var parent = nodes[parentID] else { continue }
-            parent.allocatedSize += node.allocatedSize
-            parent.isIncomplete = true
-            nodes[parentID] = parent
-            changedNodeIDs.insert(parentID)
-        }
-    }
-
-    func takeProgress() -> ScanProgress {
-        let updated = changedNodeIDs.compactMap { nodes[$0]?.summary }
-        changedNodeIDs.removeAll(keepingCapacity: true)
-        let completed = Array(completedDirectoryURLs)
-        completedDirectoryURLs.removeAll(keepingCapacity: true)
-        return ScanProgress(
-            discoveredNodeCount: nodeOrder.count,
-            completedDirectoryCount: completedDirectories,
-            currentURL: currentURL,
-            updatedNodes: updated,
-            completedDirectoryURLs: completed
-        )
-    }
-
-    func result(for source: ScanSource) -> ScanResult {
-        let status: ScanResultStatus = incompleteReasons.isEmpty ? .complete : .incomplete(incompleteReasons)
-        return ScanResult(source: source, nodes: nodeOrder.compactMap { nodes[$0]?.summary }, status: status)
-    }
-
-    private func addDirectFileSize(_ allocated: Int64, to nodeID: ScanNodeID) {
-        guard var node = nodes[nodeID] else { return }
-        node.allocatedSize += allocated
-        nodes[nodeID] = node
-        changedNodeIDs.insert(nodeID)
-    }
-
-    private func resolveCompletedDirectories(startingAt nodeID: ScanNodeID) {
-        var currentID: ScanNodeID? = nodeID
-        while let id = currentID,
-              var node = nodes[id],
-              node.hasFinishedEnumeration,
-              node.pendingChildDirectories == 0,
-              !node.hasCommittedSizeToParent {
-            node.hasCommittedSizeToParent = true
-            nodes[id] = node
-            completedDirectories += 1
-            completedDirectoryURLs.insert(node.url)
-            guard let parentID = node.parentID, var parent = nodes[parentID] else { break }
-            parent.pendingChildDirectories -= 1
-            parent.allocatedSize += node.allocatedSize
-            if node.isIncomplete {
-                parent.isIncomplete = true
-                incompleteReasons.insert(.unreadableItem)
-            }
-            nodes[parentID] = parent
-            changedNodeIDs.insert(parentID)
-            currentID = parentID
-        }
-    }
 }
 
 struct RingFIFO<Element> {
@@ -754,8 +549,8 @@ actor ProgressPublisher {
         if collectsPerformanceMetrics {
             submissionCount += 1
             snapshotNanos &+= ScanPerformanceDiagnostics.elapsed(since: snapshotStartedAt)
-            snapshotNodeCount += progress.updatedNodes.count
-            maximumSnapshotNodeCount = max(maximumSnapshotNodeCount, progress.updatedNodes.count)
+            snapshotNodeCount += progress.changedParentIDs.count
+            maximumSnapshotNodeCount = max(maximumSnapshotNodeCount, progress.changedParentIDs.count)
         }
         let sinkStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
         await sink(progress)
@@ -777,7 +572,7 @@ actor ProgressPublisher {
     }
 }
 
-private struct FileStatus: Sendable {
+struct FileStatus: Sendable {
     let deviceID: Int64
     let inode: UInt64
     let linkCount: UInt32

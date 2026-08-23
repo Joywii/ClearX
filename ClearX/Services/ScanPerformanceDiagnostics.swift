@@ -97,6 +97,54 @@ struct ProgressPublisherPerformanceSnapshot: Sendable {
     let maximumSnapshotNodeCount: Int
 }
 
+struct ScanMemoryPerformanceSnapshot: Sendable {
+    let baselineBytes: UInt64?
+    let peakBytes: UInt64?
+    let finalBytes: UInt64?
+}
+
+/// Samples physical footprint only when scan diagnostics are enabled.
+actor ScanMemorySampler {
+    private let baselineBytes: UInt64?
+    private var peakBytes: UInt64?
+
+    init() {
+        let baselineBytes = ScanPerformanceDiagnostics.residentMemoryBytes()
+        self.baselineBytes = baselineBytes
+        self.peakBytes = baselineBytes
+    }
+
+    func samplePeriodically() async {
+        while !Task.isCancelled {
+            sample()
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch {
+                break
+            }
+        }
+    }
+
+    func finish() -> ScanMemoryPerformanceSnapshot {
+        let finalBytes = ScanPerformanceDiagnostics.residentMemoryBytes()
+        record(finalBytes)
+        return ScanMemoryPerformanceSnapshot(
+            baselineBytes: baselineBytes,
+            peakBytes: peakBytes,
+            finalBytes: finalBytes
+        )
+    }
+
+    private func sample() {
+        record(ScanPerformanceDiagnostics.residentMemoryBytes())
+    }
+
+    private func record(_ bytes: UInt64?) {
+        guard let bytes else { return }
+        peakBytes = max(peakBytes ?? 0, bytes)
+    }
+}
+
 enum ScanPerformanceDiagnostics {
     private static let logger = Logger(subsystem: "com.hang.clearx", category: "ScanPerformance")
     private static let checkpointDirectoryInterval = 10_000
@@ -126,6 +174,7 @@ enum ScanPerformanceDiagnostics {
         metrics: ScanWorkerPerformanceMetrics,
         queue: DirectoryQueuePerformanceSnapshot,
         publisher: ProgressPublisherPerformanceSnapshot,
+        memory: ScanMemoryPerformanceSnapshot,
         elapsedNanos: UInt64,
         finalizationNanos: UInt64,
         resultMaterializationNanos: UInt64
@@ -138,9 +187,11 @@ enum ScanPerformanceDiagnostics {
         case .incomplete:
             status = "incomplete"
         }
-        let residentMB = residentMemoryBytes().map { String(format: "%.1f", Double($0) / 1_048_576) } ?? "unknown"
+        let baselineMB = megabytes(memory.baselineBytes)
+        let peakMB = megabytes(memory.peakBytes)
+        let finalMB = megabytes(memory.finalBytes)
         emit(
-            "final scan=\(scanID) status=\(status) elapsed_ms=\(milliseconds(elapsedNanos)) nodes=\(result.nodes.count) dirs=\(metrics.directoryCount) items=\(metrics.discoveredItemCount) nodes_per_s=\(rate(result.nodes.count, elapsedNanos)) resident_mb=\(residentMB) list_ms=\(milliseconds(metrics.listingNanos)) lstat_ms=\(milliseconds(metrics.metadataNanos)) permit_wait_ms=\(milliseconds(metrics.permitWaitNanos)) apply_ms=\(milliseconds(metrics.accumulatorApplyNanos)) finish_ms=\(milliseconds(metrics.accumulatorFinishNanos)) queue_ms=\(milliseconds(metrics.queueNanos)) progress_snapshot_ms=\(milliseconds(publisher.snapshotNanos)) progress_sink_ms=\(milliseconds(publisher.sinkNanos)) progress_publications=\(publisher.deliveryCount) snapshot_nodes=\(publisher.snapshotNodeCount) snapshot_nodes_max=\(publisher.maximumSnapshotNodeCount) finalize_ms=\(milliseconds(finalizationNanos)) result_build_ms=\(milliseconds(resultMaterializationNanos))"
+            "final scan=\(scanID) status=\(status) elapsed_ms=\(milliseconds(elapsedNanos)) nodes=\(result.nodeCount) dirs=\(metrics.directoryCount) items=\(metrics.discoveredItemCount) nodes_per_s=\(rate(result.nodeCount, elapsedNanos)) memory_baseline_mb=\(baselineMB) memory_peak_mb=\(peakMB) memory_final_mb=\(finalMB) list_ms=\(milliseconds(metrics.listingNanos)) lstat_ms=\(milliseconds(metrics.metadataNanos)) permit_wait_ms=\(milliseconds(metrics.permitWaitNanos)) apply_ms=\(milliseconds(metrics.accumulatorApplyNanos)) finish_ms=\(milliseconds(metrics.accumulatorFinishNanos)) queue_ms=\(milliseconds(metrics.queueNanos)) progress_snapshot_ms=\(milliseconds(publisher.snapshotNanos)) progress_sink_ms=\(milliseconds(publisher.sinkNanos)) progress_publications=\(publisher.deliveryCount) snapshot_nodes=\(publisher.snapshotNodeCount) snapshot_nodes_max=\(publisher.maximumSnapshotNodeCount) finalize_ms=\(milliseconds(finalizationNanos)) result_build_ms=\(milliseconds(resultMaterializationNanos))"
         )
         emit(
             "queue scan=\(scanID) enqueued=\(queue.enqueuedCount) dequeued=\(queue.dequeuedCount) peak_pending=\(queue.peakPendingCount) promotions=\(queue.focusPromotionCount) stale_entries=\(queue.staleEntryCount)"
@@ -171,11 +222,15 @@ enum ScanPerformanceDiagnostics {
         return String(format: "%.1f", Double(count) * 1_000_000_000 / Double(elapsedNanos))
     }
 
+    private static func megabytes(_ bytes: UInt64?) -> String {
+        bytes.map { String(format: "%.1f", Double($0) / 1_048_576) } ?? "unknown"
+    }
+
     private static func emit(_ message: String) {
         logger.notice("CLEARX_SCAN \(message, privacy: .public)")
     }
 
-    private static func residentMemoryBytes() -> UInt64? {
+    static func residentMemoryBytes() -> UInt64? {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
         let result = withUnsafeMutablePointer(to: &info) { pointer in

@@ -23,7 +23,3 @@ protocol ScanWorkPrioritizing: Sendable {
 protocol ScanSourceCataloging: Sendable {
     func discoverSources() async -> [ScanSource]
 }
-
-protocol EventReplaying: Sendable {
-    func replay(from checkpoint: EventCheckpoint, for source: ScanSource) async throws -> EventReplay
-}

@@ -14,7 +14,7 @@ actor ScanCoordinator {
     private var waitingFocused = [DirectoryPermitRequest]()
     private var waitingBackground = [DirectoryPermitRequest]()
 
-    init(maximumConcurrentDirectoryEnumerations: Int = 8, maximumConcurrentDirectoriesPerSource: Int = 8) {
+    init(maximumConcurrentDirectoryEnumerations: Int = 4, maximumConcurrentDirectoriesPerSource: Int = 4) {
         self.maximumConcurrentDirectoryEnumerations = max(1, maximumConcurrentDirectoryEnumerations)
         self.maximumConcurrentDirectoriesPerSource = max(1, maximumConcurrentDirectoriesPerSource)
     }

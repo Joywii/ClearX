@@ -13,11 +13,13 @@ final class FileTreeScannerTests: XCTestCase {
 
         let source = ScanSource(kind: .folder, rootURL: root)
         let result = try await FileTreeScanner().scan(source: source, request: ScanRequest(rootURL: root, sourceID: source.id))
+        let nodes = await result.allNodes()
+        let rootNodeValue = await result.snapshot.rootNode()
 
         XCTAssertEqual(result.status, .complete)
-        XCTAssertFalse(result.nodes.contains { $0.name == "linked-nested" })
-        let rootNode = try XCTUnwrap(result.rootNode)
-        let nestedNode = try XCTUnwrap(result.nodes.first { $0.name == "nested" })
+        XCTAssertFalse(nodes.contains { $0.name == "linked-nested" })
+        let rootNode = try XCTUnwrap(rootNodeValue)
+        let nestedNode = try XCTUnwrap(nodes.first { $0.name == "nested" })
         XCTAssertEqual(rootNode.allocatedSize, nestedNode.allocatedSize)
     }
 
@@ -31,11 +33,14 @@ final class FileTreeScannerTests: XCTestCase {
 
         let source = ScanSource(kind: .folder, rootURL: root)
         let result = try await FileTreeScanner().scan(source: source, request: ScanRequest(rootURL: root, sourceID: source.id))
-        let linkedNodes = result.nodes.filter { $0.name == "first.bin" || $0.name == "second.bin" }
+        let nodes = await result.allNodes()
+        let rootNodeValue = await result.snapshot.rootNode()
+        let rootNode = try XCTUnwrap(rootNodeValue)
+        let linkedNodes = nodes.filter { $0.name == "first.bin" || $0.name == "second.bin" }
 
         XCTAssertEqual(linkedNodes.count, 2)
         XCTAssertEqual(linkedNodes.filter(\.countsTowardAllocatedSize).count, 1)
-        XCTAssertEqual(linkedNodes.map(\.allocatedSize).reduce(0, +), try XCTUnwrap(result.rootNode).allocatedSize)
+        XCTAssertEqual(linkedNodes.map(\.allocatedSize).reduce(0, +), rootNode.allocatedSize)
     }
 
     func testScannerMarksMissingRootIncomplete() async throws {
@@ -43,9 +48,10 @@ final class FileTreeScannerTests: XCTestCase {
         let source = ScanSource(kind: .folder, rootURL: root)
 
         let result = try await FileTreeScanner().scan(source: source, request: ScanRequest(rootURL: root, sourceID: source.id))
+        let rootNode = await result.snapshot.rootNode()
 
         XCTAssertEqual(result.status, .incomplete([.sourceUnavailable]))
-        XCTAssertTrue(try XCTUnwrap(result.rootNode).isIncomplete)
+        XCTAssertTrue(try XCTUnwrap(rootNode).isIncomplete)
     }
 
     func testScannerKeepsAccessibleSiblingsWhenDirectoryIsUnreadable() async throws {
@@ -59,8 +65,9 @@ final class FileTreeScannerTests: XCTestCase {
 
         let source = ScanSource(kind: .folder, rootURL: root)
         let result = try await FileTreeScanner().scan(source: source, request: ScanRequest(rootURL: root, sourceID: source.id))
+        let nodes = await result.allNodes()
 
-        XCTAssertTrue(result.nodes.contains { $0.name == "visible.bin" })
+        XCTAssertTrue(nodes.contains { $0.name == "visible.bin" })
         XCTAssertEqual(result.status, .incomplete([.unreadableItem]))
     }
 
@@ -73,15 +80,17 @@ final class FileTreeScannerTests: XCTestCase {
 
         let source = ScanSource(kind: .folder, rootURL: root)
         let collector = ScanProgressCollector()
-        _ = try await FileTreeScanner().scan(
+        let result = try await FileTreeScanner().scan(
             source: source,
             request: ScanRequest(rootURL: root, sourceID: source.id),
             progress: { progress in await collector.append(progress) }
         )
 
         let progress = await collector.values()
-        XCTAssertTrue(progress.contains { $0.updatedNodes.contains(where: { $0.name == "item.bin" }) })
-        XCTAssertTrue(progress.contains { $0.completedDirectoryURLs.contains(root.standardizedFileURL) })
+        let rootNodeValue = await result.snapshot.rootNode()
+        let rootNode = try XCTUnwrap(rootNodeValue)
+        XCTAssertTrue(progress.contains { !$0.changedParentIDs.isEmpty })
+        XCTAssertTrue(progress.contains { $0.completedDirectoryIDs.contains(rootNode.id) })
         XCTAssertTrue(progress.allSatisfy { $0.completedDirectoryCount <= 2 })
     }
 
@@ -97,12 +106,14 @@ final class FileTreeScannerTests: XCTestCase {
 
         let source = ScanSource(kind: .folder, rootURL: root)
         let result = try await FileTreeScanner().scan(source: source, request: ScanRequest(rootURL: root, sourceID: source.id))
-        let rootNode = try XCTUnwrap(result.rootNode)
-        let firstNode = try XCTUnwrap(result.nodes.first { $0.name == "first" })
-        let secondNode = try XCTUnwrap(result.nodes.first { $0.name == "second" })
-        let thirdNode = try XCTUnwrap(result.nodes.first { $0.name == "third" })
-        let rootFile = try XCTUnwrap(result.nodes.first { $0.name == "root.bin" })
-        let leafFile = try XCTUnwrap(result.nodes.first { $0.name == "leaf.bin" })
+        let nodes = await result.allNodes()
+        let rootNodeValue = await result.snapshot.rootNode()
+        let rootNode = try XCTUnwrap(rootNodeValue)
+        let firstNode = try XCTUnwrap(nodes.first { $0.name == "first" })
+        let secondNode = try XCTUnwrap(nodes.first { $0.name == "second" })
+        let thirdNode = try XCTUnwrap(nodes.first { $0.name == "third" })
+        let rootFile = try XCTUnwrap(nodes.first { $0.name == "root.bin" })
+        let leafFile = try XCTUnwrap(nodes.first { $0.name == "leaf.bin" })
 
         XCTAssertEqual(thirdNode.allocatedSize, leafFile.allocatedSize)
         XCTAssertEqual(secondNode.allocatedSize, thirdNode.allocatedSize)
@@ -128,7 +139,8 @@ final class FileTreeScannerTests: XCTestCase {
             return XCTFail("Expected cancellation to keep an incomplete result")
         }
         XCTAssertTrue(reasons.contains(.cancelled))
-        XCTAssertTrue(try XCTUnwrap(result.rootNode).isIncomplete)
+        let rootNode = await result.snapshot.rootNode()
+        XCTAssertTrue(try XCTUnwrap(rootNode).isIncomplete)
     }
 
     private func makeTemporaryDirectory() throws -> URL {

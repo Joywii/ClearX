@@ -17,20 +17,36 @@ struct ScanProgress: Sendable, Hashable {
     let discoveredNodeCount: Int
     let completedDirectoryCount: Int
     let currentURL: URL?
-    /// Changed nodes are an incremental, self-contained view of the live tree.
-    /// Consumers retain the previous nodes and replace entries with matching IDs.
-    let updatedNodes: [ScanNodeSummary]
-    /// A directory appears here once all of its currently reachable descendants
-    /// have been enumerated. Its size is exact unless it is marked incomplete.
-    let completedDirectoryURLs: [URL]
+    /// Storage already owns node values. Progress only invalidates visible columns.
+    let changedParentIDs: Set<ScanNodeID>
+    let completedDirectoryIDs: Set<ScanNodeID>
 
-    init(discoveredNodeCount: Int, completedDirectoryCount: Int, currentURL: URL?, updatedNodes: [ScanNodeSummary] = [], completedDirectoryURLs: [URL] = []) {
+    init(
+        discoveredNodeCount: Int,
+        completedDirectoryCount: Int,
+        currentURL: URL?,
+        changedParentIDs: Set<ScanNodeID> = [],
+        completedDirectoryIDs: Set<ScanNodeID> = []
+    ) {
         self.discoveredNodeCount = discoveredNodeCount
         self.completedDirectoryCount = completedDirectoryCount
         self.currentURL = currentURL?.standardizedFileURL
-        self.updatedNodes = updatedNodes
-        self.completedDirectoryURLs = completedDirectoryURLs.map(\.standardizedFileURL)
+        self.changedParentIDs = changedParentIDs
+        self.completedDirectoryIDs = completedDirectoryIDs
     }
+}
+
+enum ScanNodePageState: Sendable, Equatable {
+    case loading
+    case partial
+    case complete
+}
+
+struct ScanNodePage: Sendable, Equatable {
+    let nodes: [ScanNodeSummary]
+    let totalCount: Int
+    let state: ScanNodePageState
+    let estimatingNodeIDs: Set<ScanNodeID>
 }
 
 enum ScanPresentationState: Sendable, Hashable {
@@ -46,22 +62,30 @@ enum ScanPresentationState: Sendable, Hashable {
 
 struct ScanResult: Sendable {
     let source: ScanSource
-    let nodes: [ScanNodeSummary]
+    let snapshot: ScanTreeStore
     let status: ScanResultStatus
     let scannedAt: Date
+    let nodeCount: Int
 
-    init(source: ScanSource, nodes: [ScanNodeSummary], status: ScanResultStatus, scannedAt: Date = Date()) {
+    init(source: ScanSource, snapshot: ScanTreeStore, status: ScanResultStatus, nodeCount: Int, scannedAt: Date = Date()) {
         self.source = source
-        self.nodes = nodes
+        self.snapshot = snapshot
         self.status = status
         self.scannedAt = scannedAt
+        self.nodeCount = nodeCount
     }
 
-    var rootNode: ScanNodeSummary? {
-        nodes.first { $0.parentID == nil }
+    init(source: ScanSource, nodes: [ScanNodeSummary], status: ScanResultStatus, scannedAt: Date = Date()) {
+        self.init(
+            source: source,
+            snapshot: ScanTreeStore(snapshotNodes: nodes, status: status),
+            status: status,
+            nodeCount: nodes.count,
+            scannedAt: scannedAt
+        )
     }
 
-    func children(of parentID: ScanNodeID) -> [ScanNodeSummary] {
-        nodes.filter { $0.parentID == parentID }.sorted(by: ScanNodeSummary.browserOrder)
+    func allNodes() async -> [ScanNodeSummary] {
+        await snapshot.allNodes()
     }
 }

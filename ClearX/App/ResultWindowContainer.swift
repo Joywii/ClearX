@@ -6,8 +6,7 @@ private final class ResultWindowSession: ObservableObject {
     let browser: ResultBrowserModel
 
     private let cache: InMemoryScanCache
-    private let liveTree = LiveScanTree()
-    private let scanner = FileTreeScanner()
+    private let displayedSnapshot: DisplayedScanSnapshot
     private var scanTask: Task<Void, Never>?
     private var hasStarted = false
     private var retainsCache = false
@@ -15,7 +14,13 @@ private final class ResultWindowSession: ObservableObject {
     init(source: ScanSource) {
         self.source = source
         self.cache = .shared
-        self.browser = ResultBrowserModel(source: source, columnLoader: InMemorySnapshotColumnLoader(cache: cache, liveTree: liveTree), workPrioritizer: ScanCoordinator.shared)
+        let displayedSnapshot = DisplayedScanSnapshot()
+        self.displayedSnapshot = displayedSnapshot
+        self.browser = ResultBrowserModel(
+            source: source,
+            columnLoader: InMemorySnapshotColumnLoader(displayedSnapshot: displayedSnapshot),
+            workPrioritizer: ScanCoordinator.shared
+        )
     }
 
     deinit {
@@ -48,13 +53,15 @@ private final class ResultWindowSession: ObservableObject {
         cancel()
         guard retainsCache else { return }
         retainsCache = false
-        Task { [cache, source] in
+        Task { [cache, displayedSnapshot, source] in
+            await displayedSnapshot.clear()
             await cache.release(source: source)
         }
     }
 
     private func loadOrScan() async {
         if let result = await cache.result(for: source) {
+            await displayedSnapshot.set(result.snapshot)
             browser.updatePresentationState(.completed(result.status))
             await browser.loadInitialColumn()
             return
@@ -63,31 +70,57 @@ private final class ResultWindowSession: ObservableObject {
     }
 
     private func scanCompletely() async {
+        let previousResult = await cache.result(for: source)
+        let candidate = ScanTreeStore()
+        let scanner = FileTreeScanner(tree: candidate)
+        let displaysCandidateDuringScan = previousResult == nil
+        if displaysCandidateDuringScan {
+            await displayedSnapshot.set(candidate)
+            await browser.loadInitialColumn()
+        }
+
         do {
-            await liveTree.reset()
             let result = try await ScanCoordinator.shared.performScan(
                 source: source,
                 request: ScanRequest(rootURL: source.rootURL, sourceID: source.id),
                 scanner: scanner,
                 progress: { [weak self] progress in
-                    await self?.publish(progress)
+                    await self?.publish(progress, refreshesVisibleColumns: displaysCandidateDuringScan)
                 }
             )
-            await cache.store(result)
-            browser.updatePresentationState(.completed(result.status))
-            await browser.loadInitialColumn()
+            if await cache.store(result) {
+                await displayedSnapshot.set(result.snapshot)
+                browser.updatePresentationState(.completed(result.status))
+                await browser.loadInitialColumn()
+            } else if let previousResult {
+                await displayedSnapshot.set(previousResult.snapshot)
+                // Preserve the last complete tree, but report the rejected candidate's outcome.
+                browser.updatePresentationState(.completed(result.status))
+                await browser.loadInitialColumn()
+            } else {
+                await displayedSnapshot.set(result.snapshot)
+                browser.updatePresentationState(.completed(result.status))
+                await browser.loadInitialColumn()
+            }
         } catch is CancellationError {
+            if let previousResult {
+                await displayedSnapshot.set(previousResult.snapshot)
+                await browser.loadInitialColumn()
+            }
             browser.updatePresentationState(.cancelled)
         } catch {
+            if let previousResult {
+                await displayedSnapshot.set(previousResult.snapshot)
+                await browser.loadInitialColumn()
+            }
             browser.updatePresentationState(.synchronizationFailed(error.localizedDescription))
         }
     }
 
-    private func publish(_ progress: ScanProgress) async {
-        await liveTree.apply(progress)
+    private func publish(_ progress: ScanProgress, refreshesVisibleColumns: Bool) async {
         browser.updatePresentationState(.scanning(progress))
-        for parent in browser.liveColumnParents() {
-            browser.applyLiveColumn(await liveTree.column(for: parent))
+        if refreshesVisibleColumns {
+            await browser.refreshVisibleColumns(for: progress)
         }
     }
 }

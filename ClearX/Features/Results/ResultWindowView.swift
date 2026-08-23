@@ -57,7 +57,7 @@ struct ResultWindowView: View {
                                         Task { await model.select(node, inColumn: index) }
                                     },
                                     onLoadMore: {
-                                        model.loadMore(inColumn: index)
+                                        Task { await model.loadMore(inColumn: index) }
                                     }
                                 )
                                 BrowserColumnResizeHandle(
@@ -106,7 +106,7 @@ private struct BrowserColumnView: View {
                     Button {
                         onSelect(node)
                     } label: {
-                        ScanNodeRowView(node: node, parentSize: column.parent?.allocatedSize, isSelected: node.id == selectedNodeID, isEstimating: column.estimatingNodeIDs.contains(node.id))
+                        ScanNodeRowView(node: node, isSelected: node.id == selectedNodeID, isEstimating: column.estimatingNodeIDs.contains(node.id))
                     }
                     .buttonStyle(.plain)
                 }
