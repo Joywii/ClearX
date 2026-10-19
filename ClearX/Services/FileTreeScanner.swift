@@ -7,9 +7,11 @@ import Foundation
 struct FileTreeScanner: FileTreeScanning {
     private let workersPerSource = 4
     private let tree: ScanTreeStore
+    private let readMountPoints: @Sendable () throws -> ScanMountPoints
 
-    init(tree: ScanTreeStore = ScanTreeStore()) {
+    init(tree: ScanTreeStore = ScanTreeStore(), readMountPoints: @escaping @Sendable () throws -> ScanMountPoints = ScanMountPoints.read) {
         self.tree = tree
+        self.readMountPoints = readMountPoints
     }
 
     func scan(source: ScanSource, request: ScanRequest, progress: (@Sendable (ScanProgress) async -> Void)? = nil) async throws -> ScanResult {
@@ -37,12 +39,25 @@ struct FileTreeScanner: FileTreeScanning {
             return ScanResult(source: source, snapshot: tree, status: completion.status, nodeCount: completion.nodeCount)
         }
 
+        let mountPoints: ScanMountPoints
+        do {
+            mountPoints = try await ScanCoordinator.shared.withDirectoryPermit(for: source.id) {
+                try Task.checkCancellation()
+                return try readMountPoints()
+            }
+        } catch is CancellationError {
+            await tree.markCancelled()
+            await tree.finalizeCancelledDirectories()
+            let completion = await tree.finishScan()
+            await publisher.publish()
+            return ScanResult(source: source, snapshot: tree, status: completion.status, nodeCount: completion.nodeCount)
+        }
+
         let memorySampler = collectsPerformanceMetrics ? ScanMemorySampler() : nil
         let memoryTask = memorySampler.map { sampler in
             Task { await sampler.samplePeriodically() }
         }
 
-        await publisher.publish()
         let progressTask = Task {
             await publisher.publishPeriodically()
         }
@@ -59,8 +74,10 @@ struct FileTreeScanner: FileTreeScanning {
                         collectsPerformanceMetrics: collectsPerformanceMetrics,
                         sourceID: source.id,
                         expectedDevice: rootStatus.deviceID,
+                        mountPoints: mountPoints,
                         queue: queue,
-                        tree: tree
+                        tree: tree,
+                        publisher: publisher
                     )
                 }
             }
@@ -111,13 +128,16 @@ struct FileTreeScanner: FileTreeScanning {
         collectsPerformanceMetrics: Bool,
         sourceID: ScanSourceID,
         expectedDevice: Int64,
+        mountPoints: ScanMountPoints,
         queue: DirectoryWorkQueue,
-        tree: ScanTreeStore
+        tree: ScanTreeStore,
+        publisher: ProgressPublisher
     ) async -> ScanWorkerPerformanceMetrics {
         var metrics = ScanWorkerPerformanceMetrics(workerID: workerID)
         while let work = await queue.next() {
             do {
                 try Task.checkCancellation()
+                await tree.startEnumeratingDirectory(work.nodeID)
                 let permitStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
                 let enumeration = try await ScanCoordinator.shared.withDirectoryPermit(for: sourceID) {
                     try Task.checkCancellation()
@@ -133,9 +153,11 @@ struct FileTreeScanner: FileTreeScanning {
                 let childDirectories: [DirectoryWork]
                 switch enumeration {
                 case let .children(items, _):
-                    childDirectories = await tree.apply(items: items, to: work.nodeID, expectedDevice: expectedDevice, childDepth: work.depth + 1)
+                    childDirectories = await tree.apply(items: items, to: work.nodeID, expectedDevice: expectedDevice,
+                                                       childDepth: work.depth + 1, mountPoints: mountPoints)
                 case .unreadable:
                     await tree.markUnreadableDirectory(work.nodeID)
+                    if work.depth == 0 { await tree.markIncomplete(.permissionRestricted) }
                     childDirectories = []
                 }
                 if collectsPerformanceMetrics {
@@ -145,15 +167,18 @@ struct FileTreeScanner: FileTreeScanning {
                         childCount: sample.childCount
                     )
                 }
-                let queueStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
-                await queue.enqueue(childDirectories)
-                if collectsPerformanceMetrics {
-                    metrics.queueNanos &+= ScanPerformanceDiagnostics.elapsed(since: queueStartedAt)
-                }
                 let finishStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
                 await tree.finishEnumeratingDirectory(work.nodeID)
                 if collectsPerformanceMetrics {
                     metrics.accumulatorFinishNanos &+= ScanPerformanceDiagnostics.elapsed(since: finishStartedAt)
+                }
+                // Show real root entries before descendants start sizing. The
+                // first column must not wait for the two-second progress tick.
+                if work.depth == 0 { await publisher.publish() }
+                let queueStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
+                await queue.enqueue(childDirectories)
+                if collectsPerformanceMetrics {
+                    metrics.queueNanos &+= ScanPerformanceDiagnostics.elapsed(since: queueStartedAt)
                 }
             } catch is CancellationError {
                 await tree.markCancelled()
@@ -176,12 +201,7 @@ struct FileTreeScanner: FileTreeScanning {
         let listingStartedAt = collectsPerformanceMetrics ? ScanPerformanceDiagnostics.now() : 0
         let childURLs: [URL]
         do {
-            // Includes dot files and traverses package contents by design.
-            childURLs = try FileManager.default.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: nil,
-                options: []
-            )
+            childURLs = try directoryContents(at: url)
         } catch {
             let sample = DirectoryEnumerationPerformanceSample(
                 childCount: 0,
@@ -212,6 +232,18 @@ struct FileTreeScanner: FileTreeScanning {
         return .children(items, sample)
     }
 
+    static func directoryContents(at url: URL) throws -> [URL] {
+        // Match lstat's filesystem representation: a trailing slash can change
+        // macOS lookup semantics (/.nofollow is empty, /.nofollow/ aliases /).
+        let enumerationURL = URL(fileURLWithPath: url.path, isDirectory: false)
+        // lstat owns metadata reads; nil would prefetch unused default properties.
+        return try FileManager.default.contentsOfDirectory(
+            at: enumerationURL,
+            includingPropertiesForKeys: [],
+            options: []
+        )
+    }
+
     fileprivate static func fileStatus(at url: URL) -> FileStatus? {
         var info = stat()
         let result = url.withUnsafeFileSystemRepresentation { path in
@@ -223,10 +255,64 @@ struct FileTreeScanner: FileTreeScanning {
     }
 }
 
+/// A per-scan mount table, independent of the source picker's visibility filters.
+struct ScanMountPoints: Sendable {
+    private let urls: Set<URL>
+
+    init(urls: [URL]) {
+        self.urls = Set(urls.map(Self.normalizedURL))
+    }
+
+    func contains(_ url: URL) -> Bool {
+        urls.contains(Self.normalizedURL(url))
+    }
+
+    static func read() throws -> ScanMountPoints {
+        var buffer: UnsafeMutablePointer<statfs>?
+        // Unlike getmntinfo, the reentrant API gives each concurrent scan its
+        // own allocation. Hidden APFS mounts must remain traversal boundaries.
+        let count = getmntinfo_r_np(&buffer, MNT_NOWAIT)
+        guard count > 0, let buffer else { throw ScanMountTableError.unavailable(errno) }
+        defer { free(buffer) }
+        var urls: [URL] = []
+        urls.reserveCapacity(Int(count))
+        for index in 0..<Int(count) {
+            let url = withUnsafePointer(to: &buffer[index].f_mntonname) { name in
+                name.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) {
+                    URL(fileURLWithFileSystemRepresentation: $0, isDirectory: false, relativeTo: nil)
+                }
+            }
+            urls.append(url)
+        }
+        return ScanMountPoints(urls: urls)
+    }
+
+    private static func normalizedURL(_ url: URL) -> URL {
+        // Match exact mount locations regardless of directory URL hints. Never
+        // resolve symlinks or use prefix matching (the root mount matches all).
+        URL(fileURLWithPath: url.standardizedFileURL.path, isDirectory: false)
+    }
+}
+
+enum ScanMountTableError: LocalizedError {
+    case unavailable(Int32)
+
+    var errorDescription: String? {
+        "无法读取系统挂载表，已停止扫描以避免重复统计"
+    }
+}
+
 struct DirectoryWork: Sendable {
     let nodeID: ScanNodeID
     let url: URL
     let depth: Int
+
+    init(nodeID: ScanNodeID, url: URL, depth: Int) {
+        self.nodeID = nodeID
+        // Normalize at the work boundary, not on every queue lookup.
+        self.url = url.standardizedFileURL
+        self.depth = depth
+    }
 }
 
 private enum DirectoryEnumeration: Sendable {
@@ -318,6 +404,7 @@ actor DirectoryWorkQueue {
     private var inFlight = 0
     private var isCancelled = false
     private var currentFocusedDirectory: URL?
+    private var currentFocusedPath: String?
     private var focusedBurstCount = 0
     private var enqueuedCount = 0
     private var dequeuedCount = 0
@@ -338,7 +425,7 @@ actor DirectoryWorkQueue {
         for item in work {
             let state = QueuedDirectoryState(work: item, generation: 0)
             queuedStates[item.nodeID] = state
-            queuedNodeIDsByURL[item.url.standardizedFileURL] = item.nodeID
+            queuedNodeIDsByURL[item.url] = item.nodeID
             let queued = QueuedDirectoryWork(work: item, generation: state.generation)
             if isInsideFocusedSubtree(item.url) {
                 focused.append(queued)
@@ -430,7 +517,7 @@ actor DirectoryWorkQueue {
     }
 
     private func refreshFocusedDirectory() async {
-        let prioritizedDirectory = await coordinator.prioritizedDirectory(for: sourceID)?.standardizedFileURL
+        let prioritizedDirectory = await coordinator.prioritizedDirectory(for: sourceID)
         guard !isCancelled, prioritizedDirectory != currentFocusedDirectory else { return }
 
         if !focused.isEmpty {
@@ -438,6 +525,7 @@ actor DirectoryWorkQueue {
             focused = RingFIFO()
         }
         currentFocusedDirectory = prioritizedDirectory
+        currentFocusedPath = prioritizedDirectory?.path
         focusedBurstCount = 0
 
         guard let prioritizedDirectory,
@@ -453,9 +541,8 @@ actor DirectoryWorkQueue {
     }
 
     private func isInsideFocusedSubtree(_ candidate: URL) -> Bool {
-        guard let currentFocusedDirectory else { return false }
-        let candidatePath = candidate.standardizedFileURL.path
-        let focusedPath = currentFocusedDirectory.path
+        guard let focusedPath = currentFocusedPath else { return false }
+        let candidatePath = candidate.path
         return candidatePath == focusedPath || candidatePath.hasPrefix(focusedPath + "/")
     }
 
@@ -495,7 +582,7 @@ actor DirectoryWorkQueue {
             return nil
         }
         queuedStates.removeValue(forKey: queued.work.nodeID)
-        queuedNodeIDsByURL.removeValue(forKey: queued.work.url.standardizedFileURL)
+        queuedNodeIDsByURL.removeValue(forKey: queued.work.url)
         dequeuedCount += 1
         return queued.work
     }

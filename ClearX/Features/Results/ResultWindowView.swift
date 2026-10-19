@@ -1,21 +1,41 @@
 import AppKit
 import SwiftUI
 
+private enum BrowserCoordinateSpace: Hashable {
+    case viewport
+}
+
 struct ResultWindowView: View {
     @ObservedObject var model: ResultBrowserModel
     let onRequestFullRescan: () -> Void
     let onCancelScan: () -> Void
     @State private var columnWidths = BrowserColumnWidthState()
+    @State private var columnReveal = BrowserColumnRevealState()
+    @State private var viewportRetention = BrowserViewportRetention()
+    @State private var columnFrames: [Int: BrowserColumnGeometry] = [:]
+    @State private var showsSizeSummary = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        browser
+        VStack(alignment: .leading, spacing: 0) {
+            if let notice = model.scanNotice {
+                Label(notice, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .padding(10)
+                Divider()
+            }
+            browser
+        }
             .navigationTitle(model.source.displayName)
             .toolbar {
-                ToolbarItem(placement: .principal) {
-                    ScanStatusLabel(state: model.presentationState)
+                ToolbarItem(placement: .primaryAction) {
+                    Button("大小统计", systemImage: "info.circle") { showsSizeSummary = true }
+                        .popover(isPresented: $showsSizeSummary) { sizeSummaryView }
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button("重新完整扫描", systemImage: "arrow.clockwise", action: onRequestFullRescan)
+                        .disabled(isScanning)
                 }
                 if isScanning {
                     ToolbarItem(placement: .primaryAction) {
@@ -23,58 +43,132 @@ struct ResultWindowView: View {
                     }
                 }
             }
-            .task { await model.loadInitialColumn() }
+    }
+
+    private var sizeSummaryView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("大小统计").font(.headline)
+            Text(model.sizeSummaryStatus).foregroundStyle(.secondary)
+            if let summary = model.sizeSummary {
+                LabeledContent("目录内容大小", value: summarySize(summary.contentAllocatedSize, summary: summary))
+                LabeledContent("全扫描硬链接去重大小", value: summarySize(summary.uniqueAllocatedSize, summary: summary))
+            }
+            Text("列表按路径累计已分配大小，硬链接在每个路径计入。全扫描汇总对同一文件对象仅计一次。")
+            Text("两者均不等于可释放空间；APFS 克隆及共享块不去重。")
+                .foregroundStyle(.secondary)
+        }
+        .font(.callout)
+        .padding(16)
+        .frame(width: 360)
+    }
+
+    private func summarySize(_ bytes: Int64, summary: ScanSizeSummary) -> String {
+        ByteCountPresentation.string(for: bytes) + (summary.isIncomplete || summary.isScanning ? "+" : "")
     }
 
     private var browser: some View {
         Group {
             if model.columns.isEmpty {
-                if isScanning {
-                    BrowserColumnSkeleton()
-                        .frame(width: BrowserColumnWidthState.defaultWidth)
-                } else {
-                    ContentUnavailableView("正在准备结果", systemImage: "internaldrive", description: Text("扫描完成后会持续显示可用结果。"))
-                }
+                Color.clear
             } else {
-                VStack(alignment: .leading, spacing: 0) {
-                    if isScanning {
-                        ScanProgressSummary(source: model.source, state: model.presentationState)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                        Divider()
-                    }
-                    ScrollView(.horizontal) {
-                        HStack(alignment: .top, spacing: 0) {
-                            ForEach(Array(model.columns.enumerated()), id: \.offset) { index, column in
-                                let width = columnWidths.width(for: index)
-                                BrowserColumnView(
-                                    column: column,
-                                    nodes: model.visibleNodes(inColumn: index),
-                                    remainingNodeCount: model.remainingNodeCount(inColumn: index),
-                                    selectedNodeID: selectedID(in: index),
-                                    width: width,
-                                    onSelect: { node in
-                                        Task { await model.select(node, inColumn: index) }
-                                    },
-                                    onLoadMore: {
-                                        Task { await model.loadMore(inColumn: index) }
+                GeometryReader { viewport in
+                    ScrollViewReader { scrollProxy in
+                        ScrollView(.horizontal) {
+                            HStack(alignment: .top, spacing: 0) {
+                                ForEach(Array(model.columns.enumerated()), id: \.offset) { index, column in
+                                    let width = columnWidths.width(for: index)
+                                    HStack(spacing: 0) {
+                                        BrowserColumnView(
+                                            column: column,
+                                            nodes: model.visibleNodes(inColumn: index),
+                                            remainingNodeCount: model.remainingNodeCount(inColumn: index),
+                                            selectedNodeID: selectedID(in: index),
+                                            width: width,
+                                            onSelect: { node in
+                                                select(node, inColumn: index, viewportWidth: viewport.size.width)
+                                            },
+                                            onLoadMore: {
+                                                Task { await model.loadMore(inColumn: index) }
+                                            }
+                                        )
+                                        .id(column.parent?.id)
+                                        BrowserColumnResizeHandle(
+                                            columnIndex: index,
+                                            width: width,
+                                            onWidthChange: { updateColumnWidth($0, for: index) },
+                                            onReset: { columnWidths.resetWidth(for: index) }
+                                        )
                                     }
-                                )
-                                BrowserColumnResizeHandle(
-                                    columnIndex: index,
-                                    width: width,
-                                    onWidthChange: { columnWidths.setWidth($0, for: index) },
-                                    onReset: { columnWidths.resetWidth(for: index) }
-                                )
+                                    .id(index)
+                                    .background {
+                                        GeometryReader { geometry in
+                                            Color.clear.preference(key: BrowserColumnFramesKey.self, value: [
+                                                index: BrowserColumnGeometry(
+                                                    parentID: column.parent?.id,
+                                                    frame: geometry.frame(in: .named(BrowserCoordinateSpace.viewport))
+                                                )
+                                            ])
+                                        }
+                                    }
+                                }
+                            }
+                            .padding(.trailing, 4)
+                            .frame(minWidth: max(viewport.size.width, viewportRetention.minimumContentWidth),
+                                   minHeight: 360, alignment: .topLeading)
+                            .background {
+                                BrowserHorizontalScrollInput {
+                                    if columnReveal.pending != nil { columnReveal.cancel() }
+                                }
                             }
                         }
-                        .padding(.trailing, 4)
-                        .frame(minHeight: 360, alignment: .topLeading)
+                        .coordinateSpace(name: BrowserCoordinateSpace.viewport)
+                        .onPreferenceChange(BrowserColumnFramesKey.self) { frames in
+                            columnFrames = frames
+                            revealColumn(using: scrollProxy, viewportWidth: viewport.size.width)
+                        }
+                        .onChange(of: columnReveal) { _, _ in
+                            revealColumn(using: scrollProxy, viewportWidth: viewport.size.width)
+                        }
                     }
                 }
             }
         }
         .frame(minWidth: 720, minHeight: 440)
+        .onChange(of: model.selectedNodeIDs.isEmpty) { _, isEmpty in
+            if isEmpty {
+                columnReveal.cancel()
+                viewportRetention.reset()
+                columnFrames = [:]
+            }
+        }
+        .onDisappear {
+            columnReveal.cancel()
+            viewportRetention.reset()
+        }
+    }
+
+    private func select(_ node: ScanNodeSummary, inColumn index: Int, viewportWidth: CGFloat) {
+        viewportRetention.capture(frames: columnFrames, viewportWidth: viewportWidth)
+        let requestID = columnReveal.begin(
+            parentID: node.id, kind: node.kind, inColumn: index, columnCount: model.columns.count
+        )
+        Task {
+            await model.select(node, inColumn: index)
+            if let requestID {
+                let succeeded = model.columns.indices.contains(index + 1)
+                    && model.columns[index + 1].parent?.id == node.id
+                    && model.selectedNodeIDs.indices.contains(index)
+                    && model.selectedNodeIDs[index] == node.id
+                columnReveal.complete(requestID, succeeded: succeeded)
+            }
+        }
+    }
+
+    private func revealColumn(using proxy: ScrollViewProxy, viewportWidth: CGFloat) {
+        guard let target = columnReveal.consume(frames: columnFrames, viewportWidth: viewportWidth) else { return }
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+            proxy.scrollTo(target.columnIndex, anchor: target.alignment == .leading ? .leading : .trailing)
+        }
     }
 
     private var isScanning: Bool {
@@ -87,6 +181,13 @@ struct ResultWindowView: View {
     private func selectedID(in columnIndex: Int) -> ScanNodeID? {
         guard model.selectedNodeIDs.indices.contains(columnIndex) else { return nil }
         return model.selectedNodeIDs[columnIndex]
+    }
+
+    private func updateColumnWidth(_ width: CGFloat, for index: Int) {
+        let clampedWidth = BrowserColumnWidthState.clampedWidth(width)
+        // Check before mutating @State, including repeated events at a width limit.
+        guard columnWidths.width(for: index) != clampedWidth else { return }
+        columnWidths.setWidth(clampedWidth, for: index)
     }
 }
 
@@ -101,17 +202,25 @@ private struct BrowserColumnView: View {
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(nodes) { node in
                     Button {
                         onSelect(node)
                     } label: {
-                        ScanNodeRowView(node: node, isSelected: node.id == selectedNodeID, isEstimating: column.estimatingNodeIDs.contains(node.id))
+                        ScanNodeRowView(
+                            node: node,
+                            isSelected: node.id == selectedNodeID,
+                            isEstimating: column.estimatingNodeIDs.contains(node.id),
+                            isPending: column.pendingNodeIDs.contains(node.id)
+                        )
                     }
                     .buttonStyle(.plain)
                 }
-                if column.state == .loading && nodes.isEmpty {
-                    BrowserColumnSkeleton(rowCount: 6)
+                if column.showsEmptyFolder {
+                    Text("空文件夹")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(10)
                 }
                 if remainingNodeCount > 0 {
                     Button("加载更多（剩余 \(remainingNodeCount) 项）", action: onLoadMore)
@@ -121,7 +230,7 @@ private struct BrowserColumnView: View {
                         .frame(maxWidth: .infinity)
                 }
             }
-            .padding(8)
+            .padding(.vertical, 2)
         }
         .frame(width: width)
         .accessibilityLabel(column.parent?.name ?? "根目录")
@@ -129,8 +238,8 @@ private struct BrowserColumnView: View {
 }
 
 struct BrowserColumnWidthState {
-    static let defaultWidth: CGFloat = 290
     static let minimumWidth: CGFloat = 220
+    static let defaultWidth: CGFloat = minimumWidth
     static let maximumWidth: CGFloat = 1_080
     static let accessibilityStep: CGFloat = 20
 
@@ -141,11 +250,23 @@ struct BrowserColumnWidthState {
     }
 
     mutating func setWidth(_ width: CGFloat, for columnIndex: Int) {
-        widthsByColumnIndex[columnIndex] = min(Self.maximumWidth, max(Self.minimumWidth, width))
+        widthsByColumnIndex[columnIndex] = Self.clampedWidth(width)
+    }
+
+    static func clampedWidth(_ width: CGFloat) -> CGFloat {
+        min(maximumWidth, max(minimumWidth, width))
     }
 
     mutating func resetWidth(for columnIndex: Int) {
         widthsByColumnIndex.removeValue(forKey: columnIndex)
+    }
+}
+
+struct BrowserColumnResizeDrag {
+    let startWidth: CGFloat
+
+    func width(forTranslation translation: CGFloat) -> CGFloat {
+        BrowserColumnWidthState.clampedWidth(startWidth + translation)
     }
 }
 
@@ -155,9 +276,9 @@ private struct BrowserColumnResizeHandle: View {
     let onWidthChange: (CGFloat) -> Void
     let onReset: () -> Void
 
-    @State private var dragStartWidth: CGFloat?
+    @State private var drag: BrowserColumnResizeDrag?
     @State private var isHovering = false
-    @State private var isDragging = false
+    @GestureState private var isDragging = false
     @State private var isCursorPushed = false
 
     var body: some View {
@@ -190,25 +311,45 @@ private struct BrowserColumnResizeHandle: View {
             }
         }
         .onDisappear {
+            drag = nil
+            isHovering = false
             updateCursor(shouldShow: false)
+        }
+        .onChange(of: isDragging) { _, dragging in
+            // GestureState also resets when a drag is cancelled without onEnded.
+            if !dragging {
+                finishDrag()
+            }
         }
     }
 
     private var resizeGesture: some Gesture {
-        DragGesture(minimumDistance: 1)
+        // The handle moves as its column grows. Measure in the fixed viewport,
+        // not in the handle or the horizontally scrolling content.
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(BrowserCoordinateSpace.viewport))
+            .updating($isDragging) { _, dragging, _ in
+                dragging = true
+            }
             .onChanged { value in
-                if dragStartWidth == nil {
-                    dragStartWidth = width
-                    isDragging = true
+                if drag == nil {
+                    drag = BrowserColumnResizeDrag(startWidth: width)
                     updateCursor(shouldShow: true)
                 }
-                onWidthChange((dragStartWidth ?? width) + value.translation.width)
+                if let drag {
+                    onWidthChange(drag.width(forTranslation: value.translation.width))
+                }
             }
-            .onEnded { _ in
-                dragStartWidth = nil
-                isDragging = false
-                updateCursor(shouldShow: isHovering)
+            .onEnded { value in
+                if let drag {
+                    onWidthChange(drag.width(forTranslation: value.translation.width))
+                }
+                finishDrag()
             }
+    }
+
+    private func finishDrag() {
+        drag = nil
+        updateCursor(shouldShow: isHovering)
     }
 
     private func updateCursor(shouldShow: Bool) {
@@ -219,122 +360,5 @@ private struct BrowserColumnResizeHandle: View {
             NSCursor.pop()
         }
         isCursorPushed = shouldShow
-    }
-}
-
-private struct ScanProgressSummary: View {
-    let source: ScanSource
-    let state: ScanPresentationState
-
-    var body: some View {
-        if case let .scanning(progress) = state {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("正在扫描 \(source.rootURL.path)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Text(currentPath(progress))
-                    .font(.caption.weight(.medium))
-                    .lineLimit(1)
-                Text("已发现 \(progress.discoveredNodeCount) 项，已完成 \(progress.completedDirectoryCount) 个目录")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .accessibilityElement(children: .combine)
-        }
-    }
-
-    private func currentPath(_ progress: ScanProgress) -> String {
-        guard let currentURL = progress.currentURL else { return "正在准备扫描范围" }
-        let rootPath = source.rootURL.standardizedFileURL.path
-        let currentPath = currentURL.standardizedFileURL.path
-        guard currentPath == rootPath || currentPath.hasPrefix(rootPath + "/") else {
-            return currentPath
-        }
-        let relative = String(currentPath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return relative.isEmpty ? "当前：扫描源根目录" : "当前：\(relative)"
-    }
-}
-
-private struct BrowserColumnSkeleton: View {
-    var rowCount = 8
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(0..<rowCount, id: \.self) { index in
-                    HStack(spacing: 8) {
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(.quaternary)
-                            .frame(width: 16, height: 16)
-                        VStack(alignment: .leading, spacing: 5) {
-                            Capsule()
-                                .fill(.quaternary)
-                                .frame(width: index.isMultiple(of: 3) ? 130 : 180, height: 11)
-                            Capsule()
-                                .fill(.quaternary)
-                                .frame(width: 72, height: 8)
-                        }
-                    }
-                    .redacted(reason: .placeholder)
-                }
-            }
-            .padding(16)
-        }
-        .accessibilityLabel("正在加载目录结果")
-    }
-}
-
-private struct ScanStatusLabel: View {
-    let state: ScanPresentationState
-
-    var body: some View {
-        Label(statusText, systemImage: symbolName)
-            .font(.callout)
-            .foregroundStyle(statusColor)
-            .lineLimit(1)
-    }
-
-    private var statusText: String {
-        switch state {
-        case .idle:
-            "等待扫描"
-        case let .scanning(progress):
-            "扫描中，已发现 \(progress.discoveredNodeCount) 项"
-        case .completed(.complete):
-            "已同步"
-        case .completed(.incomplete), .incomplete, .cancelled:
-            "结果不完整"
-        case .permissionRestricted:
-            "部分项目无法访问"
-        case .unavailable:
-            "扫描源不可用"
-        case .synchronizationFailed:
-            "同步失败"
-        }
-    }
-
-    private var symbolName: String {
-        switch state {
-        case .completed(.complete):
-            "checkmark.circle"
-        case .scanning:
-            "arrow.triangle.2.circlepath"
-        case .idle:
-            "clock"
-        default:
-            "exclamationmark.triangle"
-        }
-    }
-
-    private var statusColor: Color {
-        switch state {
-        case .completed(.complete):
-            .secondary
-        case .scanning, .idle:
-            .accentColor
-        default:
-            .orange
-        }
     }
 }

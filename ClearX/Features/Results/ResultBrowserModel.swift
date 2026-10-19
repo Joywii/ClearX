@@ -6,6 +6,7 @@ final class ResultBrowserModel: ObservableObject {
     @Published private(set) var columns: [SnapshotBrowserColumn] = []
     @Published private(set) var selectedNodeIDs: [ScanNodeID] = []
     @Published private(set) var presentationState: ScanPresentationState
+    @Published private(set) var isDisplayingPreviousResult = false
 
     let source: ScanSource
 
@@ -15,6 +16,15 @@ final class ResultBrowserModel: ObservableObject {
 
     static let initialColumnRowLimit = 250
 
+    var sizeSummary: ScanSizeSummary? { columns.first?.sizeSummary }
+
+    var sizeSummaryStatus: String {
+        guard let summary = sizeSummary else { return "尚无统计结果" }
+        if isDisplayingPreviousResult { return "上次完整结果" }
+        if summary.isScanning { return "当前已统计，扫描尚未结束" }
+        return summary.isIncomplete ? "部分结果，统计不完整" : "完整结果"
+    }
+
     init(source: ScanSource, columnLoader: any SnapshotColumnLoading, workPrioritizer: (any ScanWorkPrioritizing)? = nil, presentationState: ScanPresentationState = .idle) {
         self.source = source
         self.columnLoader = columnLoader
@@ -22,26 +32,84 @@ final class ResultBrowserModel: ObservableObject {
         self.presentationState = presentationState
     }
 
-    func loadInitialColumn() async {
+    func loadInitialColumn(resetNavigation: Bool = false) async {
         queryGeneration &+= 1
+        if resetNavigation {
+            selectedNodeIDs.removeAll()
+            columns.removeAll()
+        }
         await replaceColumn(at: 0, parent: nil, generation: queryGeneration)
+    }
+
+    func refreshAllColumns() async {
+        guard !columns.isEmpty else {
+            await loadInitialColumn()
+            return
+        }
+        queryGeneration &+= 1
+        let generation = queryGeneration
+        for index in columns.indices {
+            guard generation == queryGeneration, columns.indices.contains(index) else { return }
+            await reloadColumn(at: index, parent: columns[index].parent,
+                               limit: max(Self.initialColumnRowLimit, columns[index].nodes.count), generation: generation)
+        }
     }
 
     func select(_ node: ScanNodeSummary, inColumn columnIndex: Int) async {
         guard columns.indices.contains(columnIndex) else { return }
 
         queryGeneration &+= 1
+        let generation = queryGeneration
         selectedNodeIDs = Array(selectedNodeIDs.prefix(columnIndex))
         selectedNodeIDs.append(node.id)
-        columns.removeSubrange(columns.index(after: columnIndex)..<columns.endIndex)
 
-        guard node.kind == .directory else { return }
+        let childIndex = columnIndex + 1
+        guard node.kind == .directory else {
+            columns = Array(columns.prefix(childIndex))
+            return
+        }
+        let existingChild = columns.indices.contains(childIndex) ? columns[childIndex] : nil
+        if let existingChild, existingChild.parent?.id == node.id, existingChild.state != .loading {
+            columns = Array(columns.prefix(childIndex)) + [existingChild]
+            return
+        }
+        // Publish the replacement slot before suspending. Removing it first lets
+        // the horizontal scroll view clamp its offset to a transient short tree.
+        columns = Array(columns.prefix(childIndex)) + [
+            SnapshotBrowserColumn(parent: node, nodes: [], state: .loading)
+        ]
         await workPrioritizer?.prioritize(directory: node.url, for: source.id)
-        await replaceColumn(at: columnIndex + 1, parent: node, generation: queryGeneration)
+        guard generation == queryGeneration else { return }
+        await replaceColumn(at: columnIndex + 1, parent: node, generation: generation)
     }
 
-    func updatePresentationState(_ newState: ScanPresentationState) {
+    func updatePresentationState(_ newState: ScanPresentationState, displayingPreviousResult: Bool? = nil) {
+        if let displayingPreviousResult { isDisplayingPreviousResult = displayingPreviousResult }
         presentationState = newState
+    }
+
+    var scanNotice: String? {
+        let message: String
+        switch presentationState {
+        case .idle, .scanning, .completed(.complete): return nil
+        case .cancelled: message = "扫描已取消"
+        case .unavailable: message = "扫描源不可用"
+        case .permissionRestricted: message = "无法读取扫描源"
+        case let .synchronizationFailed(detail): message = "扫描失败：\(detail)"
+        case let .incomplete(reason): return notice(for: [reason])
+        case let .completed(.incomplete(reasons)): return notice(for: reasons)
+        }
+        return message + (isDisplayingPreviousResult ? "，仍显示上次完整结果。" : "。")
+    }
+
+    private func notice(for reasons: Set<ScanIncompleteReason>) -> String? {
+        let message: String
+        if reasons.contains(.sourceUnavailable) { message = "扫描源不可用" }
+        else if reasons.contains(.permissionRestricted) { message = "无法读取扫描源" }
+        else if reasons.contains(.cancelled) { message = "扫描已取消" }
+        else if isDisplayingPreviousResult { message = "本次扫描不完整" }
+        else { return nil }
+        return message + (isDisplayingPreviousResult ? "，仍显示上次完整结果。" : "，当前结果可能不完整。")
     }
 
     func visibleNodes(inColumn index: Int) -> ArraySlice<ScanNodeSummary> {
@@ -65,6 +133,7 @@ final class ResultBrowserModel: ObservableObject {
         guard !columns.isEmpty else { return }
         let generation = queryGeneration
         for index in columns.indices {
+            guard generation == queryGeneration, columns.indices.contains(index) else { return }
             let parentID = columns[index].parent?.id
             let shouldRefreshRoot = index == 0 && (!progress.changedParentIDs.isEmpty || !progress.completedDirectoryIDs.isEmpty)
             let shouldRefreshParent = parentID.map {
@@ -92,6 +161,9 @@ final class ResultBrowserModel: ObservableObject {
             }
         } catch {
             guard generation == queryGeneration else { return }
+            if columns.indices.contains(index), columns[index].state == .loading {
+                columns = Array(columns.prefix(index))
+            }
             presentationState = .synchronizationFailed(error.localizedDescription)
         }
     }

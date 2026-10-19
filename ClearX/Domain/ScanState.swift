@@ -42,11 +42,20 @@ enum ScanNodePageState: Sendable, Equatable {
     case complete
 }
 
+struct ScanSizeSummary: Sendable, Equatable {
+    let contentAllocatedSize: Int64
+    let uniqueAllocatedSize: Int64
+    let isScanning: Bool
+    let isIncomplete: Bool
+}
+
 struct ScanNodePage: Sendable, Equatable {
     let nodes: [ScanNodeSummary]
     let totalCount: Int
     let state: ScanNodePageState
     let estimatingNodeIDs: Set<ScanNodeID>
+    var pendingNodeIDs: Set<ScanNodeID> = []
+    var sizeSummary: ScanSizeSummary? = nil
 }
 
 enum ScanPresentationState: Sendable, Hashable {
@@ -75,10 +84,10 @@ struct ScanResult: Sendable {
         self.nodeCount = nodeCount
     }
 
-    init(source: ScanSource, nodes: [ScanNodeSummary], status: ScanResultStatus, scannedAt: Date = Date()) {
+    init(source: ScanSource, nodes: [ScanNodeSummary], status: ScanResultStatus, scannedAt: Date = Date(), uniqueAllocatedSize: Int64? = nil) {
         self.init(
             source: source,
-            snapshot: ScanTreeStore(snapshotNodes: nodes, status: status),
+            snapshot: ScanTreeStore(snapshotNodes: nodes, status: status, uniqueAllocatedSize: uniqueAllocatedSize),
             status: status,
             nodeCount: nodes.count,
             scannedAt: scannedAt

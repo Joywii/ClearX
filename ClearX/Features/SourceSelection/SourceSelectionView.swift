@@ -22,7 +22,6 @@ struct SourceSelectionView: View {
             Button(action: chooseFolder) {
                 Label("选择文件夹…", systemImage: "folder.badge.plus")
             }
-            .keyboardShortcut("o", modifiers: .command)
 
             if let loadError = model.loadError {
                 ContentUnavailableView("无法加载扫描源", systemImage: "exclamationmark.triangle", description: Text(loadError))

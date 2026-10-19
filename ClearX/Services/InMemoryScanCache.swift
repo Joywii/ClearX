@@ -88,7 +88,10 @@ struct InMemorySnapshotColumnLoader: SnapshotColumnLoading {
             nodes: page.nodes,
             totalNodeCount: page.totalCount,
             state: columnState(from: page.state),
-            estimatingNodeIDs: page.estimatingNodeIDs
+            estimatingNodeIDs: page.estimatingNodeIDs,
+            pendingNodeIDs: page.pendingNodeIDs,
+            isIncomplete: (currentParent ?? root)?.isIncomplete ?? false,
+            sizeSummary: parent == nil ? page.sizeSummary : nil
         )
     }
 

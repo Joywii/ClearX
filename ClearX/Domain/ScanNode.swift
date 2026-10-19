@@ -13,6 +13,8 @@ struct ScanNodeID: RawRepresentable, Hashable, Codable, Sendable, Identifiable {
 enum ScanNodeKind: String, Codable, Sendable {
     case directory
     case file
+    case symbolicLink
+    case mountPoint
     case other
 }
 
@@ -21,9 +23,10 @@ struct ScanNodeSummary: Identifiable, Hashable, Codable, Sendable {
     let parentID: ScanNodeID?
     let url: URL
     let kind: ScanNodeKind
+    /// Per-path allocated bytes; directory totals include every hard-link path.
     var allocatedSize: Int64
     let modificationDate: Date?
-    var countsTowardAllocatedSize: Bool
+    var isHardLink: Bool
     var isIncomplete: Bool
 
     init(
@@ -33,7 +36,7 @@ struct ScanNodeSummary: Identifiable, Hashable, Codable, Sendable {
         kind: ScanNodeKind,
         allocatedSize: Int64,
         modificationDate: Date? = nil,
-        countsTowardAllocatedSize: Bool = true,
+        isHardLink: Bool = false,
         isIncomplete: Bool = false
     ) {
         self.id = id
@@ -42,7 +45,7 @@ struct ScanNodeSummary: Identifiable, Hashable, Codable, Sendable {
         self.kind = kind
         self.allocatedSize = max(0, allocatedSize)
         self.modificationDate = modificationDate
-        self.countsTowardAllocatedSize = countsTowardAllocatedSize
+        self.isHardLink = isHardLink
         self.isIncomplete = isIncomplete
     }
 

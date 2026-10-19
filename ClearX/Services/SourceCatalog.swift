@@ -3,7 +3,7 @@ import Foundation
 
 actor SourceCatalog: ScanSourceCataloging {
     func discoverSources() async -> [ScanSource] {
-        var sources = [machineDiskSource()]
+        var sources = (try? await machineDiskSource()).map { [$0] } ?? []
         let keys: Set<URLResourceKey> = [
             .volumeIsLocalKey,
             .volumeIsReadOnlyKey,
@@ -36,9 +36,16 @@ actor SourceCatalog: ScanSourceCataloging {
         ScanSource(kind: .folder, rootURL: rootURL, displayName: rootURL.lastPathComponent, volume: volumeIdentity(for: rootURL))
     }
 
-    private func machineDiskSource() -> ScanSource {
+    func machineDiskSource() async throws -> ScanSource {
+        // Use the startup filesystem's normal namespace, not a volume-list
+        // position or the APFS Data mount, which duplicates its user directories.
         let rootURL = URL(fileURLWithPath: "/", isDirectory: true)
-        return ScanSource(kind: .machineDisk, rootURL: rootURL, displayName: "本机磁盘", volume: volumeIdentity(for: rootURL))
+        let values = try rootURL.resourceValues(forKeys: [.isDirectoryKey, .volumeIsLocalKey])
+        guard values.isDirectory == true, values.volumeIsLocal == true,
+              let volume = volumeIdentity(for: rootURL) else {
+            throw CocoaError(.fileReadUnknown, userInfo: [NSURLErrorKey: rootURL])
+        }
+        return ScanSource(kind: .machineDisk, rootURL: rootURL, displayName: "本机磁盘", volume: volume)
     }
 
     private func volumeIdentity(for url: URL) -> VolumeIdentity? {

@@ -16,19 +16,32 @@ struct SnapshotBrowserColumn: Sendable, Equatable {
     let totalNodeCount: Int
     let state: SnapshotBrowserColumnState
     let estimatingNodeIDs: Set<ScanNodeID>
+    let pendingNodeIDs: Set<ScanNodeID>
+    let isIncomplete: Bool
+    let sizeSummary: ScanSizeSummary?
+
+    var showsEmptyFolder: Bool {
+        state == .complete && totalNodeCount == 0 && !isIncomplete
+    }
 
     init(
         parent: ScanNodeSummary?,
         nodes: [ScanNodeSummary],
         totalNodeCount: Int? = nil,
         state: SnapshotBrowserColumnState = .complete,
-        estimatingNodeIDs: Set<ScanNodeID> = []
+        estimatingNodeIDs: Set<ScanNodeID> = [],
+        pendingNodeIDs: Set<ScanNodeID> = [],
+        isIncomplete: Bool = false,
+        sizeSummary: ScanSizeSummary? = nil
     ) {
         self.parent = parent
-        self.nodes = state == .complete ? nodes.sorted(by: ScanNodeSummary.browserOrder) : nodes
+        self.nodes = nodes.sorted(by: ScanNodeSummary.browserOrder)
         self.totalNodeCount = totalNodeCount ?? nodes.count
         self.state = state
         self.estimatingNodeIDs = estimatingNodeIDs
+        self.pendingNodeIDs = pendingNodeIDs
+        self.isIncomplete = isIncomplete
+        self.sizeSummary = sizeSummary
     }
 }
 

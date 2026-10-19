@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import ClearX
 
@@ -50,6 +51,131 @@ final class ResultBrowserModelTests: XCTestCase {
         XCTAssertEqual(requestedParents, [nil])
     }
 
+    func testSwitchingSiblingKeepsChildSlotThroughoutSuspendedLoad() async throws {
+        let first = makeNode(name: "first", kind: .directory, size: 2)
+        let second = makeNode(name: "second", kind: .directory, size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [first, second])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await model.select(first, inColumn: 0)
+        var publishedCounts: [Int] = []
+        let subscription = model.$columns.sink { publishedCounts.append($0.count) }
+        defer { subscription.cancel() }
+
+        await loader.pauseNextLoad(for: second.id)
+        let selection = Task { await model.select(second, inColumn: 0) }
+        await loader.waitUntilPaused()
+        XCTAssertEqual(model.selectedNodeIDs, [second.id])
+        let placeholder = try XCTUnwrap(model.columns.last)
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertEqual(placeholder.parent?.id, second.id)
+        XCTAssertEqual(placeholder.state, .loading)
+        XCTAssertTrue(placeholder.nodes.isEmpty)
+
+        await loader.resumeLoad()
+        await selection.value
+        XCTAssertEqual(model.columns[1].state, .complete)
+        XCTAssertTrue(publishedCounts.allSatisfy { $0 == 2 }, "No transient removal before the replacement")
+    }
+
+    func testReselectingDirectoryKeepsLoadedChildPageButTruncatesDeeperNavigation() async {
+        let directory = makeNode(name: "directory", kind: .directory, size: 500)
+        let children = (0..<251).map { makeNode(name: "child-\($0)", parentID: directory.id, kind: .directory, size: Int64($0)) }
+        let loader = ColumnLoaderStub(columns: [
+            nil: SnapshotBrowserColumn(parent: nil, nodes: [directory]),
+            directory.id: SnapshotBrowserColumn(parent: directory, nodes: children)
+        ])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await model.select(directory, inColumn: 0)
+        await model.loadMore(inColumn: 1)
+        await model.select(children[0], inColumn: 1)
+        let childColumn = model.columns[1]
+        let requestsBefore = await loader.requestedParents()
+
+        await model.select(directory, inColumn: 0)
+
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertEqual(model.columns[1], childColumn)
+        XCTAssertEqual(model.columns[1].nodes.count, 251)
+        XCTAssertEqual(model.selectedNodeIDs, [directory.id])
+        let requestsAfter = await loader.requestedParents()
+        XCTAssertEqual(requestsAfter, requestsBefore)
+    }
+
+    func testStaleChildLoadCannotOverwriteNewerSelection() async {
+        let first = makeNode(name: "first", kind: .directory, size: 2)
+        let second = makeNode(name: "second", kind: .directory, size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [first, second])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await loader.pauseNextLoad(for: first.id)
+        let earlier = Task { await model.select(first, inColumn: 0) }
+        await loader.waitUntilPaused()
+        await model.select(second, inColumn: 0)
+        await loader.resumeLoad()
+        await earlier.value
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertEqual(model.columns[1].parent?.id, second.id)
+        XCTAssertEqual(model.selectedNodeIDs, [second.id])
+    }
+
+    func testLeafSelectionRemovesLoadingChildAndIgnoresItsCompletion() async {
+        let directory = makeNode(name: "directory", kind: .directory, size: 2)
+        let file = makeNode(name: "file", size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [directory, file])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await loader.pauseNextLoad(for: directory.id)
+        let earlier = Task { await model.select(directory, inColumn: 0) }
+        await loader.waitUntilPaused()
+        await model.select(file, inColumn: 0)
+        await loader.resumeLoad()
+        await earlier.value
+        XCTAssertEqual(model.columns.count, 1)
+        XCTAssertEqual(model.selectedNodeIDs, [file.id])
+    }
+
+    func testFailedChildLoadRemovesPlaceholderAndAllowsRetry() async {
+        let directory = makeNode(name: "directory", kind: .directory, size: 2)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [directory])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await loader.pauseNextLoad(for: directory.id)
+        let selection = Task { await model.select(directory, inColumn: 0) }
+        await loader.waitUntilPaused()
+        await loader.resumeLoad(failing: true)
+        await selection.value
+        XCTAssertEqual(model.columns.count, 1)
+        guard case .synchronizationFailed = model.presentationState else {
+            return XCTFail("Expected a load failure, not a permanent loading column")
+        }
+        await model.select(directory, inColumn: 0)
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertEqual(model.columns[1].state, .complete)
+    }
+
+    func testEarlierSelectionCannotReplaceLaterSelectionAfterPrioritization() async {
+        let first = makeNode(name: "first", kind: .directory, size: 2)
+        let second = makeNode(name: "second", kind: .directory, size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [first, second])])
+        let prioritizer = SuspendedFirstPrioritizer()
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader, workPrioritizer: prioritizer)
+        await model.loadInitialColumn()
+        let earlierSelection = Task { await model.select(first, inColumn: 0) }
+        await prioritizer.waitUntilSuspended()
+
+        await model.select(second, inColumn: 0)
+        await prioritizer.resume()
+        await earlierSelection.value
+
+        XCTAssertEqual(model.selectedNodeIDs, [second.id])
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertEqual(model.columns[1].parent?.id, second.id)
+        let requestedParents = await loader.requestedParents()
+        XCTAssertEqual(requestedParents, [nil, second.id])
+    }
+
     func testLoadFailureShowsSynchronizationFailure() async {
         let model = ResultBrowserModel(source: makeSource(), columnLoader: FailingColumnLoader())
 
@@ -60,7 +186,21 @@ final class ResultBrowserModelTests: XCTestCase {
         }
     }
 
-    func testPartialLiveUpdateKeepsExistingRowOrderUntilColumnCompletes() async {
+    func testSelectingTraversalBoundaryDoesNotLoadAnAdditionalColumn() async {
+        for kind in [ScanNodeKind.symbolicLink, .mountPoint] {
+            let node = makeNode(name: "boundary", kind: kind, size: 0)
+            let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [node])])
+            let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+            await model.loadInitialColumn()
+            await model.select(node, inColumn: 0)
+            XCTAssertEqual(model.columns.count, 1)
+            XCTAssertEqual(model.selectedNodeIDs, [node.id])
+            let requestedParents = await loader.requestedParents()
+            XCTAssertEqual(requestedParents, [nil])
+        }
+    }
+
+    func testPartialLiveUpdateSortsByCurrentSize() async {
         let first = makeNode(name: "先发现", size: 10)
         let second = makeNode(name: "后发现", size: 100)
         let loader = ColumnLoaderStub(columns: [
@@ -72,7 +212,7 @@ final class ResultBrowserModelTests: XCTestCase {
         await loader.setColumn(SnapshotBrowserColumn(parent: nil, nodes: [first, second], state: .partial), for: nil)
         await model.refreshVisibleColumns(for: makeProgress(changedParentIDs: [ScanNodeID()]))
 
-        XCTAssertEqual(model.columns[0].nodes.map(\.id), [first.id, second.id])
+        XCTAssertEqual(model.columns[0].nodes.map(\.id), [second.id, first.id])
         XCTAssertEqual(model.columns[0].state, .partial)
 
         await loader.setColumn(SnapshotBrowserColumn(parent: nil, nodes: [first, second], state: .complete), for: nil)
@@ -100,7 +240,7 @@ final class ResultBrowserModelTests: XCTestCase {
         XCTAssertEqual(model.remainingNodeCount(inColumn: 0), 0)
     }
 
-    func testLiveLoadingColumnSupportsSkeletonStateAndEstimateMarkers() async {
+    func testLiveLoadingColumnKeepsRealRowsAndEstimateMarkers() async {
         let node = makeNode(name: "目录", kind: .directory, size: 0)
         let loader = ColumnLoaderStub(columns: [
             nil: SnapshotBrowserColumn(parent: nil, nodes: [node], state: .loading, estimatingNodeIDs: [node.id])
@@ -116,6 +256,9 @@ final class ResultBrowserModelTests: XCTestCase {
     func testColumnWidthsAreRetainedByDepthAndResetIndependently() {
         var widths = BrowserColumnWidthState()
 
+        XCTAssertEqual(BrowserColumnWidthState.defaultWidth, BrowserColumnWidthState.minimumWidth)
+        XCTAssertEqual(widths.width(for: 0), 220)
+
         widths.setWidth(480, for: 2)
         widths.setWidth(360, for: 1)
 
@@ -127,6 +270,53 @@ final class ResultBrowserModelTests: XCTestCase {
 
         XCTAssertEqual(widths.width(for: 1), 360)
         XCTAssertEqual(widths.width(for: 2), BrowserColumnWidthState.defaultWidth)
+        XCTAssertEqual(widths.width(for: 2), BrowserColumnWidthState.minimumWidth)
+    }
+
+    func testLiveResortingReloadsPrefixWithoutDuplicatesAndPreservesSelection() async {
+        let source = makeSource()
+        let store = ScanTreeStore()
+        let root = await store.begin(rootURL: source.rootURL, kind: .directory)
+        let items: [DiscoveredItem] = (0..<251).map { index in
+            var info = stat()
+            info.st_dev = 1
+            info.st_ino = UInt64(index + 1)
+            info.st_mode = mode_t(S_IFDIR)
+            return .item(source.rootURL.appending(path: String(format: "folder-%03d", index)), FileStatus(info: info))
+        }
+        let work = await store.apply(items: items, to: root, expectedDevice: 1, childDepth: 1)
+        let displayed = DisplayedScanSnapshot()
+        await displayed.set(store)
+        let model = ResultBrowserModel(source: source, columnLoader: InMemorySnapshotColumnLoader(displayedSnapshot: displayed))
+        await model.loadInitialColumn()
+        let selected = model.columns[0].nodes[0]
+        await model.select(selected, inColumn: 0)
+
+        var fileInfo = stat()
+        fileInfo.st_dev = 1
+        fileInfo.st_ino = 999
+        fileInfo.st_mode = mode_t(S_IFREG)
+        fileInfo.st_blocks = 8
+        let last = work[250]
+        _ = await store.apply(items: [.item(last.url.appending(path: "file"), FileStatus(info: fileInfo))],
+                              to: last.nodeID, expectedDevice: 1, childDepth: 2)
+        await model.loadMore(inColumn: 0)
+        XCTAssertEqual(model.columns[0].nodes.first?.id, last.nodeID)
+        XCTAssertEqual(model.columns[0].nodes.count, 251)
+        XCTAssertEqual(Set(model.columns[0].nodes.map(\.id)).count, 251)
+        XCTAssertEqual(model.selectedNodeIDs, [selected.id])
+
+        await store.markCancelled()
+        await store.finalizeCancelledDirectories()
+        _ = await store.finishScan()
+        await model.refreshAllColumns()
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertTrue(model.columns.allSatisfy { $0.estimatingNodeIDs.isEmpty && $0.pendingNodeIDs.isEmpty })
+        XCTAssertTrue(model.columns[1].isIncomplete)
+        XCTAssertEqual(model.selectedNodeIDs, [selected.id])
+        await model.loadInitialColumn(resetNavigation: true)
+        XCTAssertEqual(model.columns.count, 1)
+        XCTAssertTrue(model.selectedNodeIDs.isEmpty)
     }
 
     func testColumnWidthsClampToSupportedRange() {
@@ -137,6 +327,42 @@ final class ResultBrowserModelTests: XCTestCase {
 
         XCTAssertEqual(widths.width(for: 0), BrowserColumnWidthState.minimumWidth)
         XCTAssertEqual(widths.width(for: 1), BrowserColumnWidthState.maximumWidth)
+    }
+
+    func testResizeUsesStartWidthRatherThanAccumulatingTranslations() {
+        let drag = BrowserColumnResizeDrag(startWidth: 290)
+        var widths = BrowserColumnWidthState()
+
+        for translation: CGFloat in [10, 20, 40, 80] {
+            widths.setWidth(drag.width(forTranslation: translation), for: 1)
+            XCTAssertEqual(widths.width(for: 1), 290 + translation)
+            XCTAssertEqual(widths.width(for: 0), BrowserColumnWidthState.defaultWidth)
+            XCTAssertEqual(widths.width(for: 2), BrowserColumnWidthState.defaultWidth)
+        }
+        // The final sample can differ from the last onChanged sample.
+        widths.setWidth(drag.width(forTranslation: 85), for: 1)
+        XCTAssertEqual(widths.width(for: 1), 375)
+    }
+
+    func testResizeReversesWithoutDriftAfterReachingWidthLimits() {
+        let drag = BrowserColumnResizeDrag(startWidth: 290)
+
+        XCTAssertEqual(drag.width(forTranslation: -100), 220)
+        XCTAssertEqual(drag.width(forTranslation: -200), 220)
+        XCTAssertEqual(drag.width(forTranslation: -60), 230)
+        XCTAssertEqual(drag.width(forTranslation: 1_000), 1_080)
+        XCTAssertEqual(drag.width(forTranslation: 800), 1_080)
+        XCTAssertEqual(drag.width(forTranslation: 780), 1_070)
+        XCTAssertEqual(drag.width(forTranslation: 0), 290)
+    }
+
+    func testNewResizeStartsFromPreviouslyCommittedWidth() {
+        let firstDrag = BrowserColumnResizeDrag(startWidth: 290)
+        let committedWidth = firstDrag.width(forTranslation: 87.5)
+        let nextDrag = BrowserColumnResizeDrag(startWidth: committedWidth)
+
+        XCTAssertEqual(nextDrag.width(forTranslation: -12.5), 365)
+        XCTAssertEqual(nextDrag.width(forTranslation: 0), 377.5)
     }
 
     private func makeSource() -> ScanSource {
@@ -164,6 +390,9 @@ final class ResultBrowserModelTests: XCTestCase {
 private actor ColumnLoaderStub: SnapshotColumnLoading {
     private var columns: [ScanNodeID?: SnapshotBrowserColumn]
     private var parents: [ScanNodeID?] = []
+    private var pausedParentID: ScanNodeID?
+    private var loadContinuation: CheckedContinuation<Void, Error>?
+    private var pauseWaiter: CheckedContinuation<Void, Never>?
 
     init(columns: [ScanNodeID?: SnapshotBrowserColumn]) {
         self.columns = columns
@@ -176,6 +405,14 @@ private actor ColumnLoaderStub: SnapshotColumnLoading {
         limit: Int
     ) async throws -> SnapshotBrowserColumn {
         parents.append(parent?.id)
+        if let pausedParentID, parent?.id == pausedParentID {
+            self.pausedParentID = nil
+            try await withCheckedThrowingContinuation { continuation in
+                loadContinuation = continuation
+                pauseWaiter?.resume()
+                pauseWaiter = nil
+            }
+        }
         let column = columns[parent?.id] ?? SnapshotBrowserColumn(parent: parent, nodes: [])
         let lowerBound = min(max(0, offset), column.nodes.count)
         let upperBound = min(column.nodes.count, lowerBound + limit)
@@ -196,6 +433,24 @@ private actor ColumnLoaderStub: SnapshotColumnLoading {
     func requestedParents() -> [ScanNodeID?] {
         parents
     }
+
+    func pauseNextLoad(for parentID: ScanNodeID) {
+        pausedParentID = parentID
+    }
+
+    func waitUntilPaused() async {
+        guard loadContinuation == nil else { return }
+        await withCheckedContinuation { pauseWaiter = $0 }
+    }
+
+    func resumeLoad(failing: Bool = false) {
+        if failing {
+            loadContinuation?.resume(throwing: CocoaError(.fileReadUnknown))
+        } else {
+            loadContinuation?.resume()
+        }
+        loadContinuation = nil
+    }
 }
 
 private struct FailingColumnLoader: SnapshotColumnLoading {
@@ -210,5 +465,31 @@ private struct FailingColumnLoader: SnapshotColumnLoading {
 
     private enum ColumnLoadError: Error {
         case unavailable
+    }
+}
+
+private actor SuspendedFirstPrioritizer: ScanWorkPrioritizing {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var started: CheckedContinuation<Void, Never>?
+    private var hasSuspended = false
+
+    func prioritize(directory: URL?, for sourceID: ScanSourceID) async {
+        guard !hasSuspended else { return }
+        hasSuspended = true
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            started?.resume()
+            started = nil
+        }
+    }
+
+    func waitUntilSuspended() async {
+        guard !hasSuspended else { return }
+        await withCheckedContinuation { started = $0 }
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
     }
 }
