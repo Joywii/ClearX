@@ -38,6 +38,16 @@ actor InMemoryScanCache {
     func removeResult(for source: ScanSource) {
         results.removeValue(forKey: source.rootURL.standardizedFileURL)
     }
+
+    func invalidate(overlapping urls: [URL]) {
+        let entries = urls.map(FileLocation.entry)
+        for root in Array(results.keys) {
+            let canonical = FileLocation.resolved(root)
+            if entries.contains(where: { FileLocation.overlaps(canonical, $0) }) {
+                results.removeValue(forKey: root)
+            }
+        }
+    }
 }
 
 actor DisplayedScanSnapshot {

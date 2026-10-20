@@ -4,6 +4,117 @@ import XCTest
 
 @MainActor
 final class ResultBrowserModelTests: XCTestCase {
+    func testOnlyActiveScanHidesTrashIncludingRescansDisplayingPreviousResults() {
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: ColumnLoaderStub(columns: [:]))
+        let progress = ScanProgress(discoveredNodeCount: 1, completedDirectoryCount: 0, currentURL: nil)
+        for previous in [false, true] {
+            model.updatePresentationState(.scanning(progress), displayingPreviousResult: previous)
+            XCTAssertTrue(model.isScanning)
+            for state in [ScanPresentationState.idle, .cancelled, .synchronizationFailed("test"),
+                          .unavailable(model.source.rootURL), .permissionRestricted(model.source.rootURL),
+                          .incomplete(.permissionRestricted),
+                          .completed(.incomplete([.cancelled])), .completed(.complete)] {
+                model.updatePresentationState(state, displayingPreviousResult: previous)
+                XCTAssertFalse(model.isScanning, "Stopped state must not hide Trash: \(state)")
+            }
+        }
+    }
+
+    func testClearingAncestorColumnKeepsLeftHighlightsAndRemovesDescendants() async {
+        let a = makeNode(name: "A", kind: .directory, size: 3)
+        let b = makeNode(name: "B", kind: .directory, size: 2)
+        let c = makeNode(name: "C", size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [a]),
+                                                a.id: SnapshotBrowserColumn(parent: a, nodes: [b]),
+                                                b.id: SnapshotBrowserColumn(parent: b, nodes: [c])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await model.select(a, inColumn: 0)
+        await model.select(b, inColumn: 1)
+        await model.select(c, inColumn: 2)
+        model.beginSelectionGesture(inColumn: 1)
+        model.updateSelection([], inColumn: 1)
+        await model.finishSelectionGesture(inColumn: 1)
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertEqual(model.highlightedIDs(inColumn: 0), [a.id])
+        XCTAssertTrue(model.highlightedIDs(inColumn: 1).isEmpty)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+        XCTAssertEqual(model.selectedNodeIDs, [a.id])
+        model.beginSelectionGesture(inColumn: 0)
+        model.updateSelection([], inColumn: 0)
+        await model.finishSelectionGesture(inColumn: 0)
+        XCTAssertEqual(model.columns.count, 1)
+        XCTAssertTrue(model.selectedNodeIDs.isEmpty)
+    }
+
+    func testMultiSelectionCollapsesAndSingleDirectoryExpandsOnlyOnRelease() async {
+        let a = makeNode(name: "A", kind: .directory, size: 2)
+        let b = makeNode(name: "B", kind: .directory, size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [a, b])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await model.select(a, inColumn: 0)
+        model.beginSelectionGesture(inColumn: 0)
+        model.updateSelection([a.id, b.id], inColumn: 0)
+        XCTAssertEqual(model.columns.count, 1)
+        XCTAssertEqual(model.contextTargets(for: a, inColumn: 0).map(\.id), [a.id, b.id])
+        model.updateSelection([b.id], inColumn: 0)
+        XCTAssertEqual(model.columns.count, 1)
+        await model.finishSelectionGesture(inColumn: 0)
+        XCTAssertEqual(model.columns.count, 2)
+        XCTAssertEqual(model.columns[1].parent?.id, b.id)
+        model.beginSelectionGesture(inColumn: 0)
+        model.updateSelection([], inColumn: 0)
+        await model.finishSelectionGesture(inColumn: 0)
+        XCTAssertEqual(model.columns.count, 1)
+        XCTAssertTrue(model.selectedItemIDs.isEmpty)
+    }
+
+    func testAncestorHighlightsAreNotBatchMembersAndContextClickDoesNotMutateSelection() async {
+        let a = makeNode(name: "A", kind: .directory, size: 2)
+        let b = makeNode(name: "B", size: 1)
+        let c = makeNode(name: "C", size: 1)
+        let d = makeNode(name: "D", size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [a]),
+                                                a.id: SnapshotBrowserColumn(parent: a, nodes: [b, c, d])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        await model.select(a, inColumn: 0)
+        model.updateSelection([b.id, c.id], inColumn: 1)
+        XCTAssertEqual(model.highlightedIDs(inColumn: 0), [a.id])
+        XCTAssertEqual(model.contextTargets(for: a, inColumn: 0).map(\.id), [a.id])
+        XCTAssertEqual(model.contextTargets(for: d, inColumn: 1).map(\.id), [d.id])
+        XCTAssertEqual(model.selectedItemIDs, [b.id, c.id])
+        XCTAssertEqual(model.selectedNodeIDs, [a.id])
+    }
+
+    func testDragFreezesOrderAndRestoresSortingWithoutLosingIDs() async {
+        let a = makeNode(name: "A", size: 2)
+        let b = makeNode(name: "B", size: 1)
+        let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [a, b])])
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: loader)
+        await model.loadInitialColumn()
+        model.beginSelectionGesture(inColumn: 0)
+        model.updateSelection([a.id, b.id], inColumn: 0)
+        let biggerB = ScanNodeSummary(id: b.id, parentID: nil, url: b.url, kind: .file, allocatedSize: 100)
+        await loader.setColumn(SnapshotBrowserColumn(parent: nil, nodes: [a, biggerB]), for: nil)
+        await model.refreshAllColumns()
+        XCTAssertEqual(model.columns[0].nodes.map(\.id), [a.id, b.id])
+        await model.finishSelectionGesture(inColumn: 0)
+        XCTAssertEqual(model.columns[0].nodes.map(\.id), [b.id, a.id])
+        XCTAssertEqual(model.selectedItemIDs, [a.id, b.id])
+    }
+
+    func testStaleNoticeSurvivesCancelledAndFailedRescans() {
+        let model = ResultBrowserModel(source: makeSource(), columnLoader: ColumnLoaderStub(columns: [:]))
+        model.isStale = true
+        model.updatePresentationState(.cancelled)
+        XCTAssertTrue(model.scanNotice?.contains("过期") == true)
+        model.updatePresentationState(.synchronizationFailed("test"))
+        XCTAssertTrue(model.scanNotice?.contains("过期") == true)
+        XCTAssertTrue(model.sizeSummaryStatus.contains("过期"))
+    }
+
     func testInitialLoadUsesRootColumn() async {
         let source = makeSource()
         let loader = ColumnLoaderStub(columns: [nil: SnapshotBrowserColumn(parent: nil, nodes: [makeNode(name: "B", size: 1), makeNode(name: "A", size: 2)])])

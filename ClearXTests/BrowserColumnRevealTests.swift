@@ -291,6 +291,12 @@ final class BrowserHorizontalScrollInputTests: XCTestCase {
         for child in element.accessibilityChildren?() ?? [] {
             if let button = findButton(label: label, in: child) { return button }
         }
+        // NSViewRepresentable hosts a separate native accessibility subtree.
+        if let view = element as? NSView {
+            for child in view.subviews {
+                if let button = findButton(label: label, in: child) { return button }
+            }
+        }
         return nil
     }
 

@@ -1,6 +1,6 @@
 # ClearX 技术设计
 
-ClearX 当前使用 SwiftUI、Swift Concurrency 和 Foundation，实现只读扫描与会话内存快照。长期持久化与 FSEvents 设计见 [2026-08-03-clearx-design.md](superpowers/specs/2026-08-03-clearx-design.md)，该文档不代表当前运行行为。
+ClearX 当前使用 SwiftUI、AppKit 桥接、Swift Concurrency 和 Foundation，实现只读扫描、会话内存快照与用户确认后的受保护移入废纸篓。长期持久化与 FSEvents 设计见 [2026-08-03-clearx-design.md](superpowers/specs/2026-08-03-clearx-design.md)，该文档不代表当前运行行为。
 
 ## 点击导航的视口稳定性
 
@@ -9,9 +9,34 @@ ClearX 当前使用 SwiftUI、Swift Concurrency 和 Foundation，实现只读扫
 - 模型在异步等待前一次性替换为新目录的加载槽位，同目录已加载子列直接复用。查询代次继续拒绝过期响应；失败移除占位，后续点击可重试。
 - 视图在点击时记录 `max(0, -首列横坐标) + 视口宽度` 作为内容最小宽度，阻止导航缩短内容时回退。该值只保留必要空白，不缓存被移除列；下一次点击重新计算，导航重置或卸载时清空。末列展开的单次最小距离定位及手动横向输入优先规则保持不变。
 - 回归验证包括异步加载期间无删列中间态、重复点击保留分页、快速选择拒绝旧响应、失败重试，以及托管 SwiftUI 窗口中点击目录和文件前后的实际横向偏移。
+- 原生纵向列嵌入后，托管测试复现 `ScrollViewProxy.scrollTo` 已收到正确目标但外层偏移未变化。`BrowserHorizontalScrollPosition` 复用原有输入桥接定位外层 `NSScrollView`，根据列几何执行即时、最小距离滚动，不再让代理在嵌套滚动视图间解析目标；无滚动动画，同样满足减少动态效果设置。
 - 2026-10-15 验证：Debug App/测试构建及全部 109 项 XCTest 通过，Release App 构建与 `git diff --check` 通过。托管窗口以 720 pt 视口、700 pt 初始横向偏移验证切换目录、重复点击和选择文件均不回退；末列被遮挡时定位至 876 pt，重置导航后回到 0 且释放留白。测试仅使用内存夹具，未递归扫描真实全盘；首次运行受沙箱 `testmanagerd` 限制，后续获准在沙箱外执行。
 
 ## 执行原则
+
+### 结果行上下文菜单（2026-10-19）
+
+- 2026-10-20 用户批准扩展为同列多选及二次确认移入废纸篓。`BrowserSelectionTable` 通过 `NSViewRepresentable` 承接原生表格、滚动与鼠标跟踪，行内容仍使用 SwiftUI；横向导航、列宽及自动定位仍由原 SwiftUI 浏览器负责。`ResultBrowserModel` 的批量选区与祖先路径分开，拖选使列查询失效并冻结排序，释放后才展开单目录和刷新排序。
+- 每个 `ScanNodeMenuSession` 固定打开时的节点 ID、URL 集合与闭包，不从后来的行号或选区取目标。右键未选中项为单项目菜单，右键多选成员只有批量废纸篓操作。临时高亮仅为真实选中样式的逻辑或，不改变选区、导航或无障碍选中语义；原生菜单结束仅撤销临时高亮。原生单元格明确提供辅助功能按钮角色、选中状态、按压及命名操作，内部仍由 SwiftUI 渲染。
+- 路径拷贝使用 `NSPasteboard` 纯文本格式，不查询文件系统。Finder 定位前在主 actor 之外使用 `lstat` 检查条目本身，保留有效目录项中的断链，不解析链接目标、不枚举目录。校验通过后用 `NSWorkspace.activateFileViewerSelecting` 传递原 URL，不使用 Shell、AppleScript 或搜索替代目标。
+- 不存在或不可访问时以窗口级操作弹窗提示，不回退父目录或自动重扫；剪贴板失败也提示。检查和 Finder 实际处理之间存在文件系统竞争，且该系统 API 无完成回调，因此不能保证校验后条目消失或 Finder 自身失败时得到应用侧反馈；不宣称确认了 Finder 最终选中状态。
+- 测试使用独立剪贴板、临时文件/包/链接和注入的 Finder 调用，避免修改真实用户剪贴板或批量打开 Finder。托管窗口验证菜单目标不随重排改变、不影响导航；原扫描与缓存测试继续作为回归门槛。
+- 验证记录：Debug App/测试目标及 Release 本地签名构建通过，全部 122 项 XCTest 通过。托管窗口通过原生事件队列发送右键和 Control-click，验证菜单弹出、实际行高亮及关闭后恢复；测试不递归扫描真实全盘，也不声称已人工验收 Finder 的最终定位。初始临时目录两次遇到 Xcode 构建服务退出，换用新临时构建目录后正常完成。
+- 高亮语义修订验证：Debug App/测试目标构建及全部 123 项 XCTest 通过。新增行状态组合测试，托管窗口同时验证原选中行与右键行的像素颜色，覆盖右键 A/B、Control-click、取消及两项菜单操作；原选中行始终高亮，未选中行仅在菜单期间高亮，导航及真实选择不变。
+
+### 废纸篓保护与会话一致性
+
+- 本机 OmniDiskSweeper 1.16 的 x86_64 静态证据：`validateSelector:`（`0x10000a2b0`）遍历所选项并调用 `isDeletableFileAtPath:`，任一失败即禁用；`_shouldUseTrashForSelectedFiles:selector:`（`0x10000a020`）在全选区位于废纸篓时改用永久删除。ClearX 采用前者的整批权限校验，明确不采用后者。内置旧帮助不作为当前行为依据；这些是静态证据，不声称完成真实删除实验。
+- `TrashService` actor 负责后台预检查、固定设备号/inode、执行前整批复核及逐项复核、系统 `trashItem` 调用与失败汇总。禁止扫描根、挂载点及其祖先目录、废纸篓及内部项目；无法确认保护条件时拒绝。符号链接以不带尾斜杠的原始 URL 操作，不改为目标 URL。
+- `FileLocation` 使用 `realpath` 解析已有祖先并保留叶链接，以路径组件判断重叠，避免 `/foo` 与 `/foobar` 混淆。缺失路径递归解析最近已有祖先，避免 Foundation 对 `/tmp` 和 `/private/tmp` 的别名结果不一致。
+- `ScanCoordinator` 在扫描入口登记完整活动范围，直到结果及缓存发布完成才释放；文件操作申请独占的重叠范围租约。活动扫描阻止移入，移入中的重叠扫描等待且可取消，独立范围不受影响。保护不只看当前窗口是否展示旧结果。缓存失效在释放操作租约前完成，避免旧扫描结果在失效后被写回。
+- `TrashOperationModel` 固定确认目标，支持停止未处理项、进度及结果报告；成功 URL 通知所有结果窗口。`ResultWindowSession` 保留旧显示快照但将其标记过期，并串行重启完整扫描；缓存失效后旧显示快照不重新写回缓存，只有完整成功消除过期标记。
+- 当前窗口 `.scanning` 状态下不创建废纸篓菜单项及其辅助功能操作，不启动删除资格轮询；右键多选成员无可用菜单项时不进入菜单追踪。停止状态（包括取消、失败、不完整）恢复入口，不取决于显示快照是否完整。菜单项目在打开时固定，扫描结束不插入；`BrowserSelectionTable.updateInput` 检测开始扫描后取消现有菜单，沿原追踪结束流程清除临时高亮。
+- 废纸篓项存在时，异步校验期间禁用，追踪期间周期复核，原因通过菜单提示和辅助功能帮助提供。其他窗口的重叠扫描仍由服务层拒绝并置灰。确认与执行再次检查，不能依赖菜单启用状态作授权。
+- 限制：系统 URL 废纸篓 API 不提供基于文件描述符的原子身份条件，最后一次 `lstat` 与系统调用间仍有外部文件替换竞态；不声称能阻止恶意并发修改。应用内扫描/操作通过租约互斥。测试不操作用户真实文件。
+- 2026-10-20 验证：Debug 构建及全部 143 项 XCTest 通过，Release 本地签名构建通过。覆盖原生 Command-click/拖选/超出已加载范围钳制、空白右键、菜单追踪期间异步启用、单项及多项菜单、双行高亮、横向定位、挂载保护、断链、权限预检查、文件身份变化、批量部分失败及停止、跨窗口扫描互斥、取消等待、缓存失效和过期快照恢复。真实系统权限查询使用自建临时夹具；移动执行使用注入实现，未移动用户文件，未人工验收真实废纸篓搬运。日志：`/private/tmp/clearx-multiselect-tests-final.log`、`/private/tmp/clearx-multiselect-release.log`。
+
+- 2026-10-21 菜单与空白点击修订：Debug 全量 146 项 XCTest 及 Release 构建通过。覆盖扫描中隐藏、停止后恢复、旧快照重扫、单选/多选菜单、左右键空白行为，以及真实 SwiftUI 状态更新在原生菜单追踪期间关闭菜单并恢复高亮。一次中间回归出现既有横向滚动偏移断言失败，随后该套件连续三轮及最终全量回归通过；尚未证明该偶发时序风险消除。日志：`/private/tmp/clearx-menu-refinements-tests-verified.log`、`/private/tmp/clearx-menu-refinements-scroll-tests.log`、`/private/tmp/clearx-menu-refinements-release.log`。未运行真实整盘扫描或移动用户文件，扫描核心未改动。
 
 ### 根目录首屏与无骨架加载
 
@@ -102,7 +127,7 @@ xcrun swiftc -O -swift-version 6 -parse-as-library \
   ClearX/Domain/ScanSource.swift ClearX/Domain/ScanNode.swift \
   ClearX/Domain/ScanProtocols.swift ClearX/Domain/ScanState.swift \
   ClearX/Services/FileTreeScanner.swift ClearX/Services/ScanTreeStore.swift \
-  ClearX/Services/ScanCoordinator.swift ClearX/Services/ScanPerformanceDiagnostics.swift \
+  ClearX/Services/ScanCoordinator.swift ClearX/Services/ScanPerformanceDiagnostics.swift ClearX/Shared/FileLocation.swift \
   ClearX/Services/InMemoryScanCache.swift ClearX/Features/Results/SnapshotColumnLoading.swift \
   Tools/ScanBenchmark.swift -o /private/tmp/clearx-benchmark/ScanBenchmark
 /private/tmp/clearx-benchmark/ScanBenchmark fixture /private/tmp/clearx-benchmark/fixture

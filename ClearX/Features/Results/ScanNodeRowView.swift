@@ -45,6 +45,9 @@ struct ScanNodeRowView: View {
     let isSelected: Bool
     let isEstimating: Bool
     let isPending: Bool
+    var isContextHighlighted = false
+
+    var isHighlighted: Bool { isSelected || isContextHighlighted }
 
     private var presentation: ScanNodeRowPresentation {
         ScanNodeRowPresentation(node: node, isEstimating: isEstimating, isPending: isPending)
@@ -69,10 +72,10 @@ struct ScanNodeRowView: View {
             }
         }
         .font(.system(size: 12, design: .monospaced))
-        .foregroundStyle(isSelected ? Color.white : presentation.textColor(for: colorScheme))
+        .foregroundStyle(isHighlighted ? Color.white : presentation.textColor(for: colorScheme))
         .padding(.horizontal, Self.horizontalInset)
         .padding(.vertical, 3)
-        .background(isSelected ? Color.accentColor : .clear)
+        .background(isHighlighted ? Color.accentColor : .clear)
         .contentShape(.rect)
         .help(node.name + "：" + presentation.sizeDescription)
         .accessibilityElement(children: .ignore)

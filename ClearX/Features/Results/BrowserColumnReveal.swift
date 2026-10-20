@@ -95,16 +95,20 @@ struct BrowserColumnRevealState: Equatable {
 /// must not be mistaken for the user overriding a pending navigation.
 struct BrowserHorizontalScrollInput: NSViewRepresentable {
     let onManualScroll: () -> Void
+    var position: BrowserHorizontalScrollPosition? = nil
 
     func makeNSView(context: Context) -> InputView {
         let view = InputView()
         view.onManualScroll = onManualScroll
+        view.position = position
         view.startMonitoring()
         return view
     }
 
     func updateNSView(_ nsView: InputView, context: Context) {
         nsView.onManualScroll = onManualScroll
+        nsView.position = position
+        if let scroll = nsView.enclosingScrollView { position?.scrollView = scroll }
     }
 
     static func dismantleNSView(_ nsView: InputView, coordinator: ()) {
@@ -113,9 +117,15 @@ struct BrowserHorizontalScrollInput: NSViewRepresentable {
 
     final class InputView: NSView {
         var onManualScroll: (() -> Void)?
+        var position: BrowserHorizontalScrollPosition?
         private var monitor: Any?
 
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let scroll = enclosingScrollView { position?.scrollView = scroll }
+        }
 
         func startMonitoring() {
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .leftMouseDown]) { [weak self] event in
@@ -148,5 +158,22 @@ struct BrowserHorizontalScrollInput: NSViewRepresentable {
             monitor = nil
             onManualScroll = nil
         }
+    }
+}
+
+/// Target the outer scroll view explicitly: ScrollViewProxy can otherwise pick
+/// an embedded native column's scroll view when resolving a newly inserted ID.
+@MainActor
+final class BrowserHorizontalScrollPosition {
+    weak var scrollView: NSScrollView?
+
+    func reveal(frame: CGRect, alignment: BrowserColumnRevealState.Alignment, viewportWidth: CGFloat) {
+        guard let scrollView, let document = scrollView.documentView else { return }
+        document.layoutSubtreeIfNeeded()
+        let delta = alignment == .leading ? frame.minX : frame.maxX - viewportWidth
+        let maximum = max(0, document.bounds.width - scrollView.contentView.bounds.width)
+        let x = min(maximum, max(0, scrollView.contentView.bounds.minX + delta))
+        scrollView.contentView.scroll(to: CGPoint(x: x, y: scrollView.contentView.bounds.minY))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 }

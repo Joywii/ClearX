@@ -5,6 +5,19 @@ import SwiftUI
 
 @MainActor
 final class ScanPresentationTests: XCTestCase {
+    func testContextHighlightDoesNotChangeActualSelection() {
+        let node = ScanNodeSummary(parentID: nil, url: URL(fileURLWithPath: "/fixture/item"),
+                                   kind: .directory, allocatedSize: 0)
+        for selected in [false, true] {
+            for contextual in [false, true] {
+                let row = ScanNodeRowView(node: node, isSelected: selected, isEstimating: false,
+                                          isPending: false, isContextHighlighted: contextual)
+                XCTAssertEqual(row.isSelected, selected)
+                XCTAssertEqual(row.isHighlighted, selected || contextual)
+            }
+        }
+    }
+
     func testEmptyFolderMessageRequiresConfirmedReadableEmptyColumn() {
         for state in [SnapshotBrowserColumnState.loading, .partial, .complete] {
             for incomplete in [false, true] {

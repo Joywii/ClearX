@@ -267,6 +267,13 @@ struct ScanMountPoints: Sendable {
         urls.contains(Self.normalizedURL(url))
     }
 
+    func protectsEntry(_ url: URL, includeDescendants: Bool) -> Bool {
+        urls.contains {
+            let mount = FileLocation.resolved($0)
+            return mount.path == url.path || (includeDescendants && FileLocation.contains(url, mount))
+        }
+    }
+
     static func read() throws -> ScanMountPoints {
         var buffer: UnsafeMutablePointer<statfs>?
         // Unlike getmntinfo, the reentrant API gives each concurrent scan its

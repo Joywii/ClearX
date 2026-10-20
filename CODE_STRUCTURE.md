@@ -7,7 +7,7 @@
 - `ClearX/Services/`：扫描树、会话缓存、来源发现、全局调度与性能诊断服务。
 - `ClearX/Features/SourceSelection/`：从文件菜单按需打开的扫描源选择页面及状态模型。
 - `ClearX/Features/Results/`：独立结果窗口、多列浏览器及状态模型。
-- `ClearX/Shared/`：格式化和通用 SwiftUI 组件。
+- `ClearX/Shared/`：格式化、文件位置比较和通用 SwiftUI 组件。
 - `ClearX/Resources/`：本地化与资源。
 - `ClearXTests/`：领域、服务和状态模型测试。
 - `Tools/ScanBenchmark.swift`：独立编译的优化构建基准入口，生成固定磁盘目录、测量真实扫描及百万节点缓存首列查询；不进入 App target。
@@ -23,6 +23,18 @@
 重新完整扫描会创建独立候选 `ScanTreeStore`。已有完整结果继续显示到候选完整结束；候选取消、不完整或失败时释放候选并保留旧快照。首次扫描没有旧快照时，可浏览不完整的候选结果，但它不会进入缓存。
 
 `ResultWindowView` 在窗口级 `@State` 中按浏览深度保存列宽。每列右边界独立调整左侧列，宽度在同一窗口内跨目录导航和重新扫描保留，关闭窗口后恢复默认值。
+
+`BrowserHorizontalScrollPosition` 通过现有 `BrowserHorizontalScrollInput` 弱引用外层横向 `NSScrollView`，按 `BrowserColumnRevealState` 的几何目标直接滚动，避免嵌套原生纵向列表使 `ScrollViewProxy` 定位失效。
+
+每列通过 `BrowserSelectionTable` 承接原生表格与鼠标跟踪，行内容仍由 SwiftUI `ScanNodeRowView` 渲染并保留辅助功能按钮。导航路径 `selectedNodeIDs` 与同列批量选区 `selectedItemIDs` 分离；拖选冻结当前列，释放后恢复排序并按 ID 保留选择，多选收起右侧列。`ScanNodeMenuSession` 固定菜单打开时的单项/多项目标，临时高亮与真实选择取逻辑或，不影响导航或无障碍选中语义。`ScanItemActions` 负责剪贴板和 Finder，失败仅由结果窗口弹窗展示。
+
+`TrashService` actor 负责保护检查、文件身份复核、逐项调用系统废纸篓 API 和失败报告；复用 `ScanMountPoints` 的可重入挂载表读取。`Shared/FileLocation.swift` 统一物理祖先归一化与组件级重叠判断。`ScanCoordinator` 对活动扫描和文件操作范围互斥，`InMemoryScanCache.invalidate` 在操作租约释放前失效受影响缓存。`TrashOperationModel` / `TrashConfirmationView` 负责冻结确认目标、默认取消、停止剩余操作及结果说明。成功通知使相关 `ResultWindowSession` 标记旧快照过期并重扫，失败或取消不能清除过期标记。
+
+`ResultBrowserModelTests` 覆盖批量选择与祖先路径分离、菜单目标、冻结排序和过期状态；`TrashServiceTests` 覆盖权限预检查、整批拒绝、身份变化、单项失败及范围互斥；托管菜单测试验证真实右键和 Control-click、导航保持及双行高亮。测试不扫描全盘、不移入用户真实文件。
+
+`ResultBrowserModel.isScanning` 从窗口当前展示状态判断扫描是否进行中，不使用旧快照的完成标记。该状态经列视图传入 `BrowserSelectionTable`，控制菜单及辅助功能废纸篓入口；菜单只在创建时决定项目集合，`updateInput` 在开始重扫时取消正在追踪的菜单。无废纸篓项时不启动资格轮询。左键空白处复用选区更新与结束流程清空该列、截断后续导航；右键空白处保持不操作。
+
+`BrowserSelectionTableTests` 通过原生鼠标事件验证 Command-click、连续拖选、已加载边界、左右键空白行为、扫描中菜单和重扫关闭菜单；`ResultBrowserModelTests` 另覆盖扫描停止状态与清空祖先列后的导航。`ResultWindowSessionTests` 以注入扫描器验证缓存失效后自动重扫、取消候选仍显示过期快照以及完整替换后解除过期状态。
 
 只有点击当前最后一列中的目录才通过 `BrowserColumnRevealState` 创建一次性横向定位请求；资格按点击瞬间的列数判断，不按视口最右可见列或导航截断后的列数判断。点击前面的列或非目录项会取消旧请求，不发起新定位。子列加载完成且布局中的父节点 ID 匹配后，仅在遮挡时最小距离滚动；超宽子列左对齐，不改变列宽。`BrowserColumnFramesKey` 仅收集列边界，不保存额外节点。`BrowserHorizontalScrollInput` 在浏览器内部观察横向滚轮、触控板及横向滚动条输入，取消待执行定位，卸载时移除事件监听；扫描刷新、分页和列宽变化不会独立发起定位。`BrowserColumnRevealTests` 覆盖末列触发限制、可见性、超宽列、请求失效及输入优先级；快速连续选择由模型的查询代次隔离。
 

@@ -7,6 +7,11 @@ final class ResultBrowserModel: ObservableObject {
     @Published private(set) var selectedNodeIDs: [ScanNodeID] = []
     @Published private(set) var presentationState: ScanPresentationState
     @Published private(set) var isDisplayingPreviousResult = false
+    @Published private(set) var selectionColumn: Int?
+    @Published private(set) var selectedItemIDs: Set<ScanNodeID> = []
+    @Published var isStale = false
+    private var frozenColumn: Int?
+    private var selectedItems: [ScanNodeSummary] = []
 
     let source: ScanSource
 
@@ -18,7 +23,13 @@ final class ResultBrowserModel: ObservableObject {
 
     var sizeSummary: ScanSizeSummary? { columns.first?.sizeSummary }
 
+    var isScanning: Bool {
+        if case .scanning = presentationState { return true }
+        return false
+    }
+
     var sizeSummaryStatus: String {
+        if isStale { return "过期结果，等待完整重扫" }
         guard let summary = sizeSummary else { return "尚无统计结果" }
         if isDisplayingPreviousResult { return "上次完整结果" }
         if summary.isScanning { return "当前已统计，扫描尚未结束" }
@@ -35,6 +46,10 @@ final class ResultBrowserModel: ObservableObject {
     func loadInitialColumn(resetNavigation: Bool = false) async {
         queryGeneration &+= 1
         if resetNavigation {
+            selectionColumn = nil
+            selectedItemIDs.removeAll()
+            selectedItems.removeAll()
+            frozenColumn = nil
             selectedNodeIDs.removeAll()
             columns.removeAll()
         }
@@ -57,6 +72,10 @@ final class ResultBrowserModel: ObservableObject {
 
     func select(_ node: ScanNodeSummary, inColumn columnIndex: Int) async {
         guard columns.indices.contains(columnIndex) else { return }
+        frozenColumn = nil
+        selectionColumn = columnIndex
+        selectedItemIDs = [node.id]
+        selectedItems = [node]
 
         queryGeneration &+= 1
         let generation = queryGeneration
@@ -83,12 +102,67 @@ final class ResultBrowserModel: ObservableObject {
         await replaceColumn(at: columnIndex + 1, parent: node, generation: generation)
     }
 
+    func highlightedIDs(inColumn index: Int) -> Set<ScanNodeID> {
+        if selectionColumn == index { return selectedItemIDs }
+        return selectedNodeIDs.indices.contains(index) ? [selectedNodeIDs[index]] : []
+    }
+
+    func contextTargets(for node: ScanNodeSummary, inColumn index: Int) -> [ScanNodeSummary] {
+        guard selectionColumn == index, selectedItemIDs.contains(node.id),
+              selectedItemIDs.count > 1, columns.indices.contains(index) else { return [node] }
+        return selectedItems
+    }
+
+    func beginSelectionGesture(inColumn index: Int) {
+        // Invalidate in-flight page queries as well as future refreshes.
+        queryGeneration &+= 1
+        frozenColumn = index
+    }
+
+    func updateSelection(_ ids: Set<ScanNodeID>, inColumn index: Int) {
+        guard columns.indices.contains(index) else { return }
+        if selectionColumn == index, selectedItemIDs == ids { return }
+        queryGeneration &+= 1
+        let previous = selectionColumn == index ? selectedItems : []
+        let visibleIDs = Set(columns[index].nodes.map(\.id))
+        let candidates = columns[index].nodes + previous.filter { !visibleIDs.contains($0.id) }
+        selectionColumn = index
+        selectedItemIDs = ids.intersection(candidates.map(\.id))
+        selectedItems = candidates.filter { selectedItemIDs.contains($0.id) }
+        selectedNodeIDs = Array(selectedNodeIDs.prefix(index))
+        columns = Array(columns.prefix(index + 1))
+    }
+
+    func finishSelectionGesture(inColumn index: Int) async {
+        frozenColumn = nil
+        if selectedItemIDs.count == 1, columns.indices.contains(index), let node = selectedItems.first {
+            await select(node, inColumn: index)
+        }
+        await refreshAllColumns()
+    }
+
     func updatePresentationState(_ newState: ScanPresentationState, displayingPreviousResult: Bool? = nil) {
         if let displayingPreviousResult { isDisplayingPreviousResult = displayingPreviousResult }
         presentationState = newState
     }
 
     var scanNotice: String? {
+        if isStale {
+            let status: String
+            switch presentationState {
+            case .scanning: status = "正在重新扫描"
+            case .cancelled: status = "重新扫描已取消"
+            case let .completed(.incomplete(reasons)):
+                status = reasons.contains(.cancelled) ? "重新扫描已取消" : "重新扫描未完整完成"
+            case let .incomplete(reason):
+                status = reason == .cancelled ? "重新扫描已取消" : "重新扫描未完整完成"
+            case let .synchronizationFailed(detail): status = "重新扫描失败：\(detail)"
+            case .unavailable: status = "扫描源不可用"
+            case .permissionRestricted: status = "无法读取扫描源"
+            default: status = "等待完整重扫"
+            }
+            return "\(status)；文件已发生变化，当前仍显示过期结果。"
+        }
         let message: String
         switch presentationState {
         case .idle, .scanning, .completed(.complete): return nil
@@ -174,6 +248,7 @@ final class ResultBrowserModel: ObservableObject {
         limit: Int,
         generation: Int
     ) async {
+        guard frozenColumn != index else { return }
         do {
             let column = try await columnLoader.loadColumn(
                 for: source,
@@ -181,7 +256,7 @@ final class ResultBrowserModel: ObservableObject {
                 offset: 0,
                 limit: limit
             )
-            guard generation == queryGeneration, columns.indices.contains(index) else { return }
+            guard generation == queryGeneration, frozenColumn != index, columns.indices.contains(index) else { return }
             columns[index] = column
         } catch {
             guard generation == queryGeneration else { return }

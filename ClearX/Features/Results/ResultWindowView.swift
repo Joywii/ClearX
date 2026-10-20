@@ -12,9 +12,11 @@ struct ResultWindowView: View {
     @State private var columnWidths = BrowserColumnWidthState()
     @State private var columnReveal = BrowserColumnRevealState()
     @State private var viewportRetention = BrowserViewportRetention()
+    @State private var horizontalPosition = BrowserHorizontalScrollPosition()
     @State private var columnFrames: [Int: BrowserColumnGeometry] = [:]
     @State private var showsSizeSummary = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var actionFailure: ScanItemActionFailure?
+    @StateObject private var trashOperation = TrashOperationModel()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -28,6 +30,17 @@ struct ResultWindowView: View {
             browser
         }
             .navigationTitle(model.source.displayName)
+            .sheet(isPresented: Binding(get: { trashOperation.isPresented }, set: { if !$0 { trashOperation.dismiss() } })) {
+                TrashConfirmationView(operation: trashOperation, root: model.source.rootURL)
+            }
+            .alert("无法完成操作", isPresented: Binding(
+                get: { actionFailure != nil },
+                set: { if !$0 { actionFailure = nil } }
+            ), presenting: actionFailure) { _ in
+                Button("好", role: .cancel) { actionFailure = nil }
+            } message: { failure in
+                Text(failure.message + "\n" + failure.url.path)
+            }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button("大小统计", systemImage: "info.circle") { showsSizeSummary = true }
@@ -72,7 +85,7 @@ struct ResultWindowView: View {
                 Color.clear
             } else {
                 GeometryReader { viewport in
-                    ScrollViewReader { scrollProxy in
+                    Group {
                         ScrollView(.horizontal) {
                             HStack(alignment: .top, spacing: 0) {
                                 ForEach(Array(model.columns.enumerated()), id: \.offset) { index, column in
@@ -80,16 +93,29 @@ struct ResultWindowView: View {
                                     HStack(spacing: 0) {
                                         BrowserColumnView(
                                             column: column,
-                                            nodes: model.visibleNodes(inColumn: index),
                                             remainingNodeCount: model.remainingNodeCount(inColumn: index),
-                                            selectedNodeID: selectedID(in: index),
+                                            highlightedIDs: model.highlightedIDs(inColumn: index),
+                                            root: model.source.rootURL,
+                                            isScanning: model.isScanning,
                                             width: width,
-                                            onSelect: { node in
-                                                select(node, inColumn: index, viewportWidth: viewport.size.width)
+                                            targets: { model.contextTargets(for: $0, inColumn: index) },
+                                            onBegin: {
+                                                viewportRetention.capture(frames: columnFrames, viewportWidth: viewport.size.width)
+                                                columnReveal.cancel()
+                                                model.beginSelectionGesture(inColumn: index)
                                             },
+                                            onSelection: { ids in
+                                                model.updateSelection(ids, inColumn: index)
+                                            },
+                                            onFinish: {
+                                                Task { await model.finishSelectionGesture(inColumn: index) }
+                                            },
+                                            onPlainClick: { select($0, inColumn: index, viewportWidth: viewport.size.width) },
                                             onLoadMore: {
                                                 Task { await model.loadMore(inColumn: index) }
-                                            }
+                                            },
+                                            onItemAction: performItemAction,
+                                            onTrash: { trashOperation.prepare($0, root: model.source.rootURL) }
                                         )
                                         .id(column.parent?.id)
                                         BrowserColumnResizeHandle(
@@ -116,18 +142,18 @@ struct ResultWindowView: View {
                             .frame(minWidth: max(viewport.size.width, viewportRetention.minimumContentWidth),
                                    minHeight: 360, alignment: .topLeading)
                             .background {
-                                BrowserHorizontalScrollInput {
+                                BrowserHorizontalScrollInput(onManualScroll: {
                                     if columnReveal.pending != nil { columnReveal.cancel() }
-                                }
+                                }, position: horizontalPosition)
                             }
                         }
                         .coordinateSpace(name: BrowserCoordinateSpace.viewport)
                         .onPreferenceChange(BrowserColumnFramesKey.self) { frames in
                             columnFrames = frames
-                            revealColumn(using: scrollProxy, viewportWidth: viewport.size.width)
+                            revealColumn(viewportWidth: viewport.size.width)
                         }
                         .onChange(of: columnReveal) { _, _ in
-                            revealColumn(using: scrollProxy, viewportWidth: viewport.size.width)
+                            revealColumn(viewportWidth: viewport.size.width)
                         }
                     }
                 }
@@ -164,23 +190,22 @@ struct ResultWindowView: View {
         }
     }
 
-    private func revealColumn(using proxy: ScrollViewProxy, viewportWidth: CGFloat) {
-        guard let target = columnReveal.consume(frames: columnFrames, viewportWidth: viewportWidth) else { return }
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
-            proxy.scrollTo(target.columnIndex, anchor: target.alignment == .leading ? .leading : .trailing)
+    private func performItemAction(_ action: ScanItemAction, at url: URL) {
+        Task {
+            if let failure = await ScanItemActions().perform(action, at: url) {
+                actionFailure = failure
+            }
         }
+    }
+
+    private func revealColumn(viewportWidth: CGFloat) {
+        guard let target = columnReveal.consume(frames: columnFrames, viewportWidth: viewportWidth),
+              let geometry = columnFrames[target.columnIndex] else { return }
+        horizontalPosition.reveal(frame: geometry.frame, alignment: target.alignment, viewportWidth: viewportWidth)
     }
 
     private var isScanning: Bool {
-        if case .scanning = model.presentationState {
-            return true
-        }
-        return false
-    }
-
-    private func selectedID(in columnIndex: Int) -> ScanNodeID? {
-        guard model.selectedNodeIDs.indices.contains(columnIndex) else { return nil }
-        return model.selectedNodeIDs[columnIndex]
+        model.isScanning
     }
 
     private func updateColumnWidth(_ width: CGFloat, for index: Int) {
@@ -193,29 +218,27 @@ struct ResultWindowView: View {
 
 private struct BrowserColumnView: View {
     let column: SnapshotBrowserColumn
-    let nodes: ArraySlice<ScanNodeSummary>
     let remainingNodeCount: Int
-    let selectedNodeID: ScanNodeID?
+    let highlightedIDs: Set<ScanNodeID>
+    let root: URL
+    let isScanning: Bool
     let width: CGFloat
-    let onSelect: (ScanNodeSummary) -> Void
+    let targets: (ScanNodeSummary) -> [ScanNodeSummary]
+    let onBegin: () -> Void
+    let onSelection: (Set<ScanNodeID>) -> Void
+    let onFinish: () -> Void
+    let onPlainClick: (ScanNodeSummary) -> Void
     let onLoadMore: () -> Void
+    let onItemAction: (ScanItemAction, URL) -> Void
+    let onTrash: ([ScanNodeSummary]) -> Void
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(nodes) { node in
-                    Button {
-                        onSelect(node)
-                    } label: {
-                        ScanNodeRowView(
-                            node: node,
-                            isSelected: node.id == selectedNodeID,
-                            isEstimating: column.estimatingNodeIDs.contains(node.id),
-                            isPending: column.pendingNodeIDs.contains(node.id)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
+        VStack(spacing: 0) {
+                BrowserSelectionTable(column: column, highlightedIDs: highlightedIDs, root: root,
+                                      isScanning: isScanning,
+                                      targets: targets, onBegin: onBegin, onSelection: onSelection,
+                                      onFinish: onFinish, onPlainClick: onPlainClick,
+                                      onAction: onItemAction, onTrash: onTrash)
                 if column.showsEmptyFolder {
                     Text("空文件夹")
                         .font(.caption)
@@ -229,8 +252,6 @@ private struct BrowserColumnView: View {
                         .padding(.vertical, 10)
                         .frame(maxWidth: .infinity)
                 }
-            }
-            .padding(.vertical, 2)
         }
         .frame(width: width)
         .accessibilityLabel(column.parent?.name ?? "根目录")

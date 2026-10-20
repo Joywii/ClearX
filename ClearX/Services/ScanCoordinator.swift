@@ -13,6 +13,9 @@ actor ScanCoordinator {
     private var prioritizedDirectories = [ScanSourceID: URL]()
     private var waitingFocused = [DirectoryPermitRequest]()
     private var waitingBackground = [DirectoryPermitRequest]()
+    private var scanningRoots: [UUID: URL] = [:]
+    private var fileOperations: [UUID: [URL]] = [:]
+    private var fileOperationWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
 
     init(maximumConcurrentDirectoryEnumerations: Int = 4, maximumConcurrentDirectoriesPerSource: Int = 4) {
         self.maximumConcurrentDirectoryEnumerations = max(1, maximumConcurrentDirectoryEnumerations)
@@ -27,8 +30,58 @@ actor ScanCoordinator {
         }
     }
 
-    func performScan(source: ScanSource, request: ScanRequest, scanner: any FileTreeScanning, progress: (@Sendable (ScanProgress) async -> Void)? = nil) async throws -> ScanResult {
-        try await scanner.scan(source: source, request: request, progress: progress)
+    func performScan(source: ScanSource, request: ScanRequest, scanner: any FileTreeScanning,
+                     progress: (@Sendable (ScanProgress) async -> Void)? = nil,
+                     publishResult: (@Sendable (ScanResult) async -> Void)? = nil) async throws -> ScanResult {
+        let root = FileLocation.resolved(source.rootURL)
+        while fileOperations.values.joined().contains(where: { FileLocation.overlaps(root, $0) }) {
+            try Task.checkCancellation()
+            let waiterID = UUID()
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try await withCheckedThrowingContinuation { fileOperationWaiters[waiterID] = $0 }
+            } onCancel: {
+                Task { await self.cancelFileOperationWaiter(waiterID) }
+            }
+        }
+        try Task.checkCancellation()
+        let id = UUID()
+        scanningRoots[id] = root
+        defer { scanningRoots.removeValue(forKey: id) }
+        let result = try await scanner.scan(source: source, request: request, progress: progress)
+        // Keep the scan range reserved until its snapshot/cache publication finishes.
+        // Otherwise a trash operation could invalidate the cache just before a stale store.
+        await publishResult?(result)
+        return result
+    }
+
+    func fileOperationBlockReason(for urls: [URL]) -> String? {
+        let entries = urls.map(FileLocation.entry)
+        if scanningRoots.values.contains(where: { root in entries.contains { FileLocation.overlaps(root, $0) } }) {
+            return "相关目录正在扫描，请等待完成或先取消扫描。"
+        }
+        if fileOperations.values.joined().contains(where: { active in entries.contains { FileLocation.overlaps(active, $0) } }) {
+            return "相关项目正在执行文件操作。"
+        }
+        return nil
+    }
+
+    func beginFileOperation(urls: [URL]) -> UUID? {
+        guard !urls.isEmpty, fileOperationBlockReason(for: urls) == nil else { return nil }
+        let id = UUID()
+        fileOperations[id] = urls.map(FileLocation.entry)
+        return id
+    }
+
+    func endFileOperation(_ id: UUID) {
+        fileOperations.removeValue(forKey: id)
+        let waiters = fileOperationWaiters
+        fileOperationWaiters.removeAll()
+        for waiter in waiters.values { waiter.resume() }
+    }
+
+    private func cancelFileOperationWaiter(_ id: UUID) {
+        fileOperationWaiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
 
     func prioritize(directory: URL?, for sourceID: ScanSourceID) {
